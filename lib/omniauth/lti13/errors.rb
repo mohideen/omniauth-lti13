@@ -52,5 +52,51 @@ module OmniAuth
         super("deployment_id #{deployment_id.inspect} is not registered for issuer #{issuer.inspect}")
       end
     end
+
+    # Raised when the id_token's header specifies (or defaults to) a JWS
+    # algorithm outside this gem's explicit allowlist -- including "none",
+    # the classic unsigned-token forgery vector. Replaces
+    # OmniAuth::Strategies::OpenIDConnect's own algorithm check, which is
+    # opt-in (only runs at all if `client_signing_alg` is explicitly
+    # configured) and checks against one configured value rather than an
+    # allowlist.
+    class DisallowedAlgorithmError < Error
+      def initialize(algorithm, allowed)
+        super("id_token signed with disallowed algorithm #{algorithm.inspect} (allowed: #{allowed.join(', ')})")
+      end
+    end
+
+    # Raised for id_token claim checks (iss/aud/nonce/iat) that this gem
+    # re-verifies itself rather than via
+    # OpenIDConnect::ResponseObject::IdToken#verify! -- that method's exp
+    # check has no clock-skew tolerance, so it can't be reused as-is (see
+    # ExpiredTokenError) and reimplementing the rest alongside it keeps all
+    # id_token claim validation in one auditable place.
+    class InvalidIdTokenError < Error
+      def initialize(reason)
+        super("id_token failed validation: #{reason}")
+      end
+    end
+
+    # Raised when the id_token is expired even after allowing for
+    # `clock_skew` seconds of tolerance (ordinary drift between our clock
+    # and the Platform's, not a security weakening -- a token past its
+    # exp-plus-skew is still rejected).
+    class ExpiredTokenError < Error
+      def initialize(exp)
+        super("id_token expired at #{exp.inspect} (beyond configured clock-skew tolerance)")
+      end
+    end
+
+    # Raised when the id_token's optional `azp` (authorized party) claim is
+    # present but doesn't match the client_id we expect. Per the OIDC Core
+    # spec, azp only needs checking when present (it disambiguates the
+    # audience when aud has multiple values); OmniAuth::Strategies::
+    # OpenIDConnect doesn't check it at all.
+    class InvalidAzpError < Error
+      def initialize(azp, expected_client_id)
+        super("id_token azp #{azp.inspect} does not match expected client_id #{expected_client_id.inspect}")
+      end
+    end
   end
 end

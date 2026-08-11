@@ -1,8 +1,11 @@
 # frozen_string_literal: true
 
 require "omniauth/lti13"
+require "webmock/rspec"
 
 Dir[File.join(__dir__, "support", "**", "*.rb")].sort.each { |f| require f }
+
+WebMock.disable_net_connect!
 
 OmniAuth.config.logger.level = Logger::ERROR
 

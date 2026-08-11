@@ -48,6 +48,22 @@ module OmniAuth
       # lookup already resolved would defeat the point of that lookup.
       option :allow_authorize_params, %i[login_hint lti_message_hint target_link_uri]
 
+      # Clock-skew tolerance (seconds) for id_token exp/iat validation --
+      # ordinary drift between our clock and the Platform's shouldn't reject
+      # an otherwise-valid launch. Configurable since deployments may want
+      # to tune it; the algorithm allowlist below isn't, since the IMS
+      # Security Framework mandates RS256 specifically.
+      option :clock_skew, 60
+
+      # IMS Security Framework 1.0 Section 5 mandates RS256 for LTI 1.3
+      # JWKS-verified id_tokens. Rejecting everything else here -- including
+      # "none", the classic unsigned-token forgery vector -- replaces
+      # OmniAuth::Strategies::OpenIDConnect's own algorithm check, which is
+      # opt-in (only runs if `client_signing_alg` is explicitly configured,
+      # which this gem doesn't do) and checks against one configured value
+      # rather than an allowlist.
+      ALLOWED_ALGORITHMS = %i[RS256].freeze
+
       REQUIRED_INITIATION_PARAMS = %w[login_hint target_link_uri].freeze
 
       # The Platform resolved for the current request by setup_phase.
@@ -73,16 +89,18 @@ module OmniAuth
         apply_platform!(platform)
       end
 
+      private
+
       # Overrides OmniAuth::Strategies::OpenIDConnect#id_token_callback_phase
       # (the callback path taken when response_type is "id_token", which is
-      # always, here). The base implementation builds a bare-bones AuthHash
-      # (uid/name/email only); this builds the full LTI auth_hash contract
-      # instead, and validates deployment_id before doing so. decode_id_token
-      # re-verifies iss/aud/nonce/signature -- already done once by
-      # verify_id_token! earlier in callback_phase, but it's a cheap decode
-      # and keeping this method self-contained (rather than threading the
-      # already-decoded token through) matches the base class's own
-      # structure.
+      # always, here; private in the base class too). The base
+      # implementation builds a bare-bones AuthHash (uid/name/email only);
+      # this builds the full LTI auth_hash contract instead, and validates
+      # deployment_id before doing so. decode_id_token re-verifies
+      # iss/aud/nonce/signature -- already done once by verify_id_token!
+      # earlier in callback_phase, but it's a cheap decode and keeping this
+      # method self-contained (rather than threading the already-decoded
+      # token through) matches the base class's own structure.
       def id_token_callback_phase
         claims = decode_id_token(params["id_token"]).raw_attributes
         validate_deployment!(claims)
@@ -91,7 +109,80 @@ module OmniAuth
         call_app!
       end
 
-      private
+      # Overrides OmniAuth::Strategies::OpenIDConnect's own algorithm check
+      # (also private, also called from decode_id_token), which only runs
+      # when `client_signing_alg` is configured and then checks against a
+      # single value. This runs unconditionally against an allowlist.
+      def validate_client_algorithm!(algorithm)
+        return if ALLOWED_ALGORITHMS.include?(algorithm)
+
+        raise OmniAuth::Lti13::DisallowedAlgorithmError.new(algorithm, ALLOWED_ALGORITHMS)
+      end
+
+      # Overrides OmniAuth::Strategies::OpenIDConnect#decode_id_token to add
+      # one retry, with a forced JWKS re-fetch, when the key referenced by
+      # the token can't be found in our current JWKS. The base method's own
+      # KidNotFound handling only retries locally (trying each key already
+      # in hand, for tokens with no kid) and re-raises immediately whenever
+      # a kid IS present but unmatched -- it never re-fetches. Without this,
+      # a Platform that rotates its signing key would 401 every launch
+      # until whatever fetched our in-memory JWKS happened to restart.
+      def decode_id_token(id_token)
+        super
+      rescue JSON::JWK::Set::KidNotFound
+        @public_key = nil
+        @fetch_key = nil
+        super
+      end
+
+      # Overrides OmniAuth::Strategies::OpenIDConnect#verify_id_token!
+      # entirely rather than calling super: the base implementation
+      # (OpenIDConnect::ResponseObject::IdToken#verify!) checks exp with no
+      # clock-skew tolerance, so a token just past nominal expiry would be
+      # rejected by that check before this method ever got a chance to
+      # apply its own, more lenient one -- there's no way to layer skew
+      # tolerance on top of an already-stricter check via super. Since
+      # iss/aud/nonce need reimplementing anyway to keep all id_token claim
+      # validation in one auditable place, azp (which the base doesn't
+      # check at all) is added alongside them here too.
+      def verify_id_token!(id_token)
+        return unless id_token
+
+        validate_claims!(decode_id_token(id_token))
+      end
+
+      def validate_claims!(decoded)
+        skew = options.clock_skew.to_i
+        now = Time.now.to_i
+        expected_nonce = params["nonce"].to_s.empty? ? stored_nonce : params["nonce"]
+
+        unless decoded.iss == options.issuer
+          raise OmniAuth::Lti13::InvalidIdTokenError, "iss #{decoded.iss.inspect} does not match expected issuer"
+        end
+
+        unless Array(decoded.aud).include?(client_options.identifier)
+          raise OmniAuth::Lti13::InvalidIdTokenError, "aud #{decoded.aud.inspect} does not include our client_id"
+        end
+
+        raise OmniAuth::Lti13::InvalidIdTokenError, "nonce does not match" unless decoded.nonce == expected_nonce
+        raise OmniAuth::Lti13::ExpiredTokenError, decoded.exp unless decoded.exp.to_i + skew >= now
+
+        if decoded.iat.to_i > now + skew
+          raise OmniAuth::Lti13::InvalidIdTokenError, "iat #{decoded.iat.inspect} is too far in the future"
+        end
+
+        validate_azp!(decoded)
+      end
+
+      # azp (authorized party) is optional per the OIDC Core spec -- it only
+      # needs checking when present, to disambiguate an aud with multiple
+      # values. OmniAuth::Strategies::OpenIDConnect doesn't check it at all.
+      def validate_azp!(decoded)
+        return if decoded.azp.to_s.empty?
+        return if decoded.azp == client_options.identifier
+
+        raise OmniAuth::Lti13::InvalidAzpError.new(decoded.azp, client_options.identifier)
+      end
 
       # `iss` is guaranteed present on the initial (request-phase) launch,
       # per the IMS OIDC third-party-initiated login spec. Platforms aren't
@@ -141,12 +232,12 @@ module OmniAuth
       end
 
       # iss and client_id are already covered by platform lookup (setup_phase)
-      # and the base class's own aud verification (verify_id_token!, earlier
-      # in callback_phase) -- this is the last leg of "iss + client_id +
-      # deployment_id together identify a registered deployment" from the
-      # prompt: reject if the token's deployment_id isn't one of the
-      # resolved platform's registered deployment_ids (including if it's
-      # simply missing from the token).
+      # and this class's own aud verification (validate_claims!, via
+      # verify_id_token! earlier in callback_phase) -- this is the last leg
+      # of "iss + client_id + deployment_id together identify a registered
+      # deployment" from the prompt: reject if the token's deployment_id
+      # isn't one of the resolved platform's registered deployment_ids
+      # (including if it's simply missing from the token).
       def validate_deployment!(claims)
         deployment_id = claims[OmniAuth::Lti13::Claims::DEPLOYMENT_ID]
         return if current_platform.deployment_id?(deployment_id)

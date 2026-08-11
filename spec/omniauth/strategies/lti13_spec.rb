@@ -53,14 +53,8 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
     # (OmniAuth.config.request_validation_phase), not per-strategy, so a
     # scoped exemption for the LTI login-initiation route is Avalon's
     # integration responsibility, not something this gem can/should do.
-    # Disabled here only so these specs can test routing/resolution, not
-    # that concern.
-    around do |example|
-      original_validation_phase = OmniAuth.config.request_validation_phase
-      OmniAuth.config.request_validation_phase = nil
-      example.run
-      OmniAuth.config.request_validation_phase = original_validation_phase
-    end
+    # Disabled (see the top-level `around` above) only so these specs can
+    # test routing/resolution, not that concern.
 
     def post_to_request_phase(platforms:, params:)
       rack_app = Rack::Builder.new do
@@ -169,55 +163,61 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
     end
   end
 
+  around do |example|
+    original_validation_phase = OmniAuth.config.request_validation_phase
+    OmniAuth.config.request_validation_phase = nil
+    example.run
+    OmniAuth.config.request_validation_phase = original_validation_phase
+  end
+
+  # Drives a full launch through both legs (request phase, then callback)
+  # against a real self-signed id_token, sharing one session Hash across
+  # both Rack calls the way a browser's session cookie would. Returns the
+  # callback response and the env the downstream app received (so
+  # env["omniauth.auth"] can be inspected). By default the strategy is
+  # configured with client_jwk_signing_key (bypassing the jwks_uri network
+  # fetch); pass use_real_jwks_uri: true to exercise that fetch instead
+  # (stub it with WebMock at the platform's jwks_uri).
+  def perform_full_launch(platforms:, issuer:, client_id:, extra_claims: {},
+                           jwt_alg: :RS256, jwt_key: rsa_key, jwt_kid: nil, use_real_jwks_uri: false)
+    session = {}
+    downstream_env = nil
+    jwk_hash = jwk.to_h
+    rack_app = Rack::Builder.new do
+      strategy_options = { platforms: platforms }
+      strategy_options[:client_jwk_signing_key] = jwk_hash unless use_real_jwks_uri
+      use OmniAuth::Strategies::Lti13, **strategy_options
+      run ->(env) do
+        downstream_env = env
+        [200, {}, ["ok"]]
+      end
+    end.to_app
+
+    request_query = valid_initiation_params.merge(iss: issuer).map { |k, v| "#{k}=#{CGI.escape(v.to_s)}" }.join("&")
+    request_env = Rack::MockRequest.env_for("/auth/lti?#{request_query}", method: "POST", "rack.session" => session)
+    rack_app.call(request_env)
+
+    claims = {
+      iss: issuer,
+      sub: "user-42",
+      aud: client_id,
+      exp: (Time.now + 300).to_i,
+      iat: Time.now.to_i,
+      nonce: session["omniauth.nonce"],
+    }.merge(extra_claims)
+    id_token = build_id_token(claims, key: jwt_key, alg: jwt_alg, kid: jwt_kid)
+
+    callback_query = { id_token: id_token, state: session["omniauth.state"] }
+                      .map { |k, v| "#{k}=#{CGI.escape(v.to_s)}" }.join("&")
+    callback_env = Rack::MockRequest.env_for(
+      "/auth/lti/callback?#{callback_query}", method: "POST", "rack.session" => session
+    )
+    callback_response = Rack::MockResponse.new(*rack_app.call(callback_env))
+
+    [callback_response, downstream_env]
+  end
+
   describe "callback phase (full launch)" do
-    around do |example|
-      original_validation_phase = OmniAuth.config.request_validation_phase
-      OmniAuth.config.request_validation_phase = nil
-      example.run
-      OmniAuth.config.request_validation_phase = original_validation_phase
-    end
-
-    # Drives a full launch through both legs (request phase, then callback)
-    # against a real self-signed id_token, sharing one session Hash across
-    # both Rack calls the way a browser's session cookie would. Returns the
-    # callback response and the env the downstream app received (so
-    # env["omniauth.auth"] can be inspected).
-    def perform_full_launch(platforms:, issuer:, client_id:, extra_claims: {})
-      session = {}
-      downstream_env = nil
-      jwk_hash = jwk.to_h
-      rack_app = Rack::Builder.new do
-        use OmniAuth::Strategies::Lti13, platforms: platforms, client_jwk_signing_key: jwk_hash
-        run ->(env) do
-          downstream_env = env
-          [200, {}, ["ok"]]
-        end
-      end.to_app
-
-      request_query = valid_initiation_params.merge(iss: issuer).map { |k, v| "#{k}=#{CGI.escape(v.to_s)}" }.join("&")
-      request_env = Rack::MockRequest.env_for("/auth/lti?#{request_query}", method: "POST", "rack.session" => session)
-      rack_app.call(request_env)
-
-      claims = {
-        iss: issuer,
-        sub: "user-42",
-        aud: client_id,
-        exp: (Time.now + 300).to_i,
-        iat: Time.now.to_i,
-        nonce: session["omniauth.nonce"],
-      }.merge(extra_claims)
-      id_token = build_id_token(claims)
-
-      callback_query = { id_token: id_token, state: session["omniauth.state"] }
-                        .map { |k, v| "#{k}=#{CGI.escape(v.to_s)}" }.join("&")
-      callback_env = Rack::MockRequest.env_for(
-        "/auth/lti/callback?#{callback_query}", method: "POST", "rack.session" => session
-      )
-      callback_response = Rack::MockResponse.new(*rack_app.call(callback_env))
-
-      [callback_response, downstream_env]
-    end
-
     it "maps a full claim set into the five-plus-one auth_hash contract Avalon expects" do
       _response, env = perform_full_launch(
         platforms: [canvas_platform],
@@ -328,6 +328,157 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
 
       expect(auth_hash.extra.key?("context_name")).to be true
       expect(auth_hash.extra.context_name).to be_nil
+    end
+  end
+
+  describe "security hardening" do
+    let(:base_deployment_claim) do
+      { "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first }
+    end
+
+    describe "JWT algorithm allowlist" do
+      it "rejects alg: none (the classic unsigned-token forgery vector)" do
+        response, env = perform_full_launch(
+          platforms: [canvas_platform],
+          issuer: canvas_platform[:issuer],
+          client_id: canvas_platform[:client_id],
+          extra_claims: base_deployment_claim,
+          jwt_alg: :none
+        )
+
+        expect(env).to be_nil
+        expect(response.status).to eq(302)
+        expect(response.location).to start_with("/auth/failure")
+      end
+
+      it "rejects an algorithm outside the allowlist even when the token is validly signed" do
+        response, env = perform_full_launch(
+          platforms: [canvas_platform],
+          issuer: canvas_platform[:issuer],
+          client_id: canvas_platform[:client_id],
+          extra_claims: base_deployment_claim,
+          jwt_alg: :HS256,
+          jwt_key: "shared-secret-no-real-platform-would-use-for-lti"
+        )
+
+        expect(env).to be_nil
+        expect(response.status).to eq(302)
+        expect(response.location).to start_with("/auth/failure")
+      end
+    end
+
+    describe "exp/iat clock-skew tolerance (default 60s)" do
+      it "rejects a token expired beyond the skew tolerance" do
+        response, env = perform_full_launch(
+          platforms: [canvas_platform],
+          issuer: canvas_platform[:issuer],
+          client_id: canvas_platform[:client_id],
+          extra_claims: base_deployment_claim.merge(exp: Time.now.to_i - 90)
+        )
+
+        expect(env).to be_nil
+        expect(response.status).to eq(302)
+        expect(response.location).to start_with("/auth/failure")
+      end
+
+      it "accepts a token expired within the skew tolerance" do
+        _response, env = perform_full_launch(
+          platforms: [canvas_platform],
+          issuer: canvas_platform[:issuer],
+          client_id: canvas_platform[:client_id],
+          extra_claims: base_deployment_claim.merge(exp: Time.now.to_i - 30)
+        )
+
+        expect(env["omniauth.auth"]).not_to be_nil
+      end
+
+      it "rejects a token whose iat is too far in the future, beyond the skew tolerance" do
+        response, env = perform_full_launch(
+          platforms: [canvas_platform],
+          issuer: canvas_platform[:issuer],
+          client_id: canvas_platform[:client_id],
+          extra_claims: base_deployment_claim.merge(iat: Time.now.to_i + 120)
+        )
+
+        expect(env).to be_nil
+        expect(response.status).to eq(302)
+        expect(response.location).to start_with("/auth/failure")
+      end
+    end
+
+    describe "azp validation" do
+      it "rejects an azp that doesn't match the resolved platform's client_id" do
+        response, env = perform_full_launch(
+          platforms: [canvas_platform],
+          issuer: canvas_platform[:issuer],
+          client_id: canvas_platform[:client_id],
+          extra_claims: base_deployment_claim.merge(azp: "some-other-client-id")
+        )
+
+        expect(env).to be_nil
+        expect(response.status).to eq(302)
+        expect(response.location).to start_with("/auth/failure")
+      end
+
+      it "accepts a token whose azp matches the resolved platform's client_id" do
+        _response, env = perform_full_launch(
+          platforms: [canvas_platform],
+          issuer: canvas_platform[:issuer],
+          client_id: canvas_platform[:client_id],
+          extra_claims: base_deployment_claim.merge(azp: canvas_platform[:client_id])
+        )
+
+        expect(env["omniauth.auth"]).not_to be_nil
+      end
+    end
+
+    describe "JWKS rotation" do
+      it "retries with a freshly re-fetched JWKS when the token's key isn't in the first fetch, " \
+         "so a Platform that rotated its signing key doesn't fail every launch until we happen to refetch" do
+        other_key = OpenSSL::PKey::RSA.generate(2048)
+        stale_jwk = JSON::JWK.new(other_key.public_key, kid: "old-key")
+        current_jwk = JSON::JWK.new(rsa_key.public_key, kid: "current-key")
+
+        stub_request(:get, canvas_platform[:jwks_uri])
+          .to_return(body: build_jwks(stale_jwk).to_json, headers: { "Content-Type" => "application/json" })
+          .then
+          .to_return(
+            body: build_jwks(stale_jwk, current_jwk).to_json, headers: { "Content-Type" => "application/json" }
+          )
+
+        _response, env = perform_full_launch(
+          platforms: [canvas_platform],
+          issuer: canvas_platform[:issuer],
+          client_id: canvas_platform[:client_id],
+          extra_claims: base_deployment_claim,
+          jwt_kid: "current-key",
+          use_real_jwks_uri: true
+        )
+
+        expect(env["omniauth.auth"]).not_to be_nil
+        expect(WebMock).to have_requested(:get, canvas_platform[:jwks_uri]).twice
+      end
+
+      it "still fails if the key isn't in the freshly re-fetched JWKS either (one retry, not infinite)" do
+        other_key = OpenSSL::PKey::RSA.generate(2048)
+        stale_jwk = JSON::JWK.new(other_key.public_key, kid: "old-key")
+
+        stub_request(:get, canvas_platform[:jwks_uri])
+          .to_return(body: build_jwks(stale_jwk).to_json, headers: { "Content-Type" => "application/json" })
+
+        response, env = perform_full_launch(
+          platforms: [canvas_platform],
+          issuer: canvas_platform[:issuer],
+          client_id: canvas_platform[:client_id],
+          extra_claims: base_deployment_claim,
+          jwt_kid: "current-key",
+          use_real_jwks_uri: true
+        )
+
+        expect(env).to be_nil
+        expect(response.status).to eq(302)
+        expect(response.location).to start_with("/auth/failure")
+      end
     end
   end
 end
