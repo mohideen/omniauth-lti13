@@ -6,7 +6,7 @@ Gem::Specification.new do |spec|
   spec.name = "omniauth-lti13"
   spec.version = OmniAuth::Lti13::VERSION
   spec.authors = ["Avalon Media System"]
-  spec.email = ["mohideen87@gmail.com"]
+  spec.email = ["mohideen@umd.edu"]
 
   spec.summary = "OmniAuth strategy for LTI 1.3 (IMS Core launch/auth) built on omniauth_openid_connect."
   spec.description = "Implements the LTI 1.3 third-party-initiated OIDC login and launch flow as an " \
@@ -16,7 +16,6 @@ Gem::Specification.new do |spec|
   spec.homepage = "https://github.com/avalonmediasystem/omniauth-lti13"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.2.0"
-  spec.metadata["homepage_uri"] = spec.homepage
   spec.metadata["source_code_uri"] = "https://github.com/avalonmediasystem/omniauth-lti13"
 
   # Specify which files should be added to the gem when it is released.
