@@ -39,5 +39,18 @@ module OmniAuth
         super("login initiation request missing required param(s): #{missing_params.join(', ')}")
       end
     end
+
+    # Raised when the id_token's deployment_id claim doesn't match any of
+    # the resolved platform's registered deployment_ids (or is missing).
+    # iss and client_id are already covered by platform lookup + the base
+    # class's own aud verification -- this closes the last leg (iss +
+    # client_id + deployment_id together identify a registered deployment,
+    # rather than collapsing them into one opaque key the way LTI 1.1's
+    # oauth_consumer_key did).
+    class DeploymentMismatchError < Error
+      def initialize(issuer, deployment_id)
+        super("deployment_id #{deployment_id.inspect} is not registered for issuer #{issuer.inspect}")
+      end
+    end
   end
 end

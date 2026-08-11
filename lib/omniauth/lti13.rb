@@ -2,6 +2,7 @@
 
 require_relative "lti13/version"
 require_relative "lti13/errors"
+require_relative "lti13/claims"
 require_relative "lti13/platform"
 require_relative "lti13/platform_registry"
 require_relative "strategies/lti13"

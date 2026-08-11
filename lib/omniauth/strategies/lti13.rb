@@ -73,6 +73,24 @@ module OmniAuth
         apply_platform!(platform)
       end
 
+      # Overrides OmniAuth::Strategies::OpenIDConnect#id_token_callback_phase
+      # (the callback path taken when response_type is "id_token", which is
+      # always, here). The base implementation builds a bare-bones AuthHash
+      # (uid/name/email only); this builds the full LTI auth_hash contract
+      # instead, and validates deployment_id before doing so. decode_id_token
+      # re-verifies iss/aud/nonce/signature -- already done once by
+      # verify_id_token! earlier in callback_phase, but it's a cheap decode
+      # and keeping this method self-contained (rather than threading the
+      # already-decoded token through) matches the base class's own
+      # structure.
+      def id_token_callback_phase
+        claims = decode_id_token(params["id_token"]).raw_attributes
+        validate_deployment!(claims)
+
+        env["omniauth.auth"] = build_auth_hash(claims)
+        call_app!
+      end
+
       private
 
       # `iss` is guaranteed present on the initial (request-phase) launch,
@@ -120,6 +138,57 @@ module OmniAuth
         client_options.redirect_uri = platform.redirect_uri
         client_options.authorization_endpoint = platform.authorization_endpoint
         client_options.jwks_uri = platform.jwks_uri
+      end
+
+      # iss and client_id are already covered by platform lookup (setup_phase)
+      # and the base class's own aud verification (verify_id_token!, earlier
+      # in callback_phase) -- this is the last leg of "iss + client_id +
+      # deployment_id together identify a registered deployment" from the
+      # prompt: reject if the token's deployment_id isn't one of the
+      # resolved platform's registered deployment_ids (including if it's
+      # simply missing from the token).
+      def validate_deployment!(claims)
+        deployment_id = claims[OmniAuth::Lti13::Claims::DEPLOYMENT_ID]
+        return if current_platform.deployment_id?(deployment_id)
+
+        raise OmniAuth::Lti13::DeploymentMismatchError.new(current_platform.issuer, deployment_id)
+      end
+
+      # `claims` is the id_token's raw_attributes: an
+      # ActiveSupport::HashWithIndifferentAccess (json-jwt's JSON::JWT base
+      # class) containing every claim in the token, standard and
+      # LTI-specific alike.
+      def build_auth_hash(claims)
+        context = claims[OmniAuth::Lti13::Claims::CONTEXT] || {}
+        label = presence(context["label"])
+        title = presence(context["title"])
+
+        AuthHash.new(
+          provider: name,
+          uid: claims["sub"],
+          info: {
+            email: claims["email"],
+          },
+          extra: {
+            # label wins over title -- deliberately preserves 1.1 semantics,
+            # where Course.title held the context label, not a full title.
+            # title is only a fallback for a Platform that sends a title but
+            # no label, so a Course isn't lost. See lti-gem-prompt.md's
+            # "Course title/label semantics" section before changing this.
+            context_id: context["id"],
+            context_name: label || title,
+            context_title: title,
+            consumer: { context_label: label },
+            roles: claims[OmniAuth::Lti13::Claims::ROLES],
+          }
+        )
+      end
+
+      def presence(value)
+        return nil if value.nil?
+        return nil if value.respond_to?(:empty?) && value.empty?
+
+        value
       end
     end
   end

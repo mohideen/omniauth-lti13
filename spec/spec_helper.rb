@@ -2,6 +2,8 @@
 
 require "omniauth/lti13"
 
+Dir[File.join(__dir__, "support", "**", "*.rb")].sort.each { |f| require f }
+
 OmniAuth.config.logger.level = Logger::ERROR
 
 RSpec.configure do |config|
@@ -14,4 +16,6 @@ RSpec.configure do |config|
   config.expect_with :rspec do |c|
     c.syntax = :expect
   end
+
+  config.include JwtHelper
 end

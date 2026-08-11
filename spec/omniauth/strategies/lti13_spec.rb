@@ -168,4 +168,166 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
       expect(response.location).to include("target_link_uri")
     end
   end
+
+  describe "callback phase (full launch)" do
+    around do |example|
+      original_validation_phase = OmniAuth.config.request_validation_phase
+      OmniAuth.config.request_validation_phase = nil
+      example.run
+      OmniAuth.config.request_validation_phase = original_validation_phase
+    end
+
+    # Drives a full launch through both legs (request phase, then callback)
+    # against a real self-signed id_token, sharing one session Hash across
+    # both Rack calls the way a browser's session cookie would. Returns the
+    # callback response and the env the downstream app received (so
+    # env["omniauth.auth"] can be inspected).
+    def perform_full_launch(platforms:, issuer:, client_id:, extra_claims: {})
+      session = {}
+      downstream_env = nil
+      jwk_hash = jwk.to_h
+      rack_app = Rack::Builder.new do
+        use OmniAuth::Strategies::Lti13, platforms: platforms, client_jwk_signing_key: jwk_hash
+        run ->(env) do
+          downstream_env = env
+          [200, {}, ["ok"]]
+        end
+      end.to_app
+
+      request_query = valid_initiation_params.merge(iss: issuer).map { |k, v| "#{k}=#{CGI.escape(v.to_s)}" }.join("&")
+      request_env = Rack::MockRequest.env_for("/auth/lti?#{request_query}", method: "POST", "rack.session" => session)
+      rack_app.call(request_env)
+
+      claims = {
+        iss: issuer,
+        sub: "user-42",
+        aud: client_id,
+        exp: (Time.now + 300).to_i,
+        iat: Time.now.to_i,
+        nonce: session["omniauth.nonce"],
+      }.merge(extra_claims)
+      id_token = build_id_token(claims)
+
+      callback_query = { id_token: id_token, state: session["omniauth.state"] }
+                        .map { |k, v| "#{k}=#{CGI.escape(v.to_s)}" }.join("&")
+      callback_env = Rack::MockRequest.env_for(
+        "/auth/lti/callback?#{callback_query}", method: "POST", "rack.session" => session
+      )
+      callback_response = Rack::MockResponse.new(*rack_app.call(callback_env))
+
+      [callback_response, downstream_env]
+    end
+
+    it "maps a full claim set into the five-plus-one auth_hash contract Avalon expects" do
+      _response, env = perform_full_launch(
+        platforms: [canvas_platform],
+        issuer: canvas_platform[:issuer],
+        client_id: canvas_platform[:client_id],
+        extra_claims: {
+          email: "student@example.edu",
+          "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first,
+          "https://purl.imsglobal.org/spec/lti/claim/context" => {
+            "id" => "course-123",
+            "label" => "TEST101",
+            "title" => "Introduction to Testing",
+          },
+          "https://purl.imsglobal.org/spec/lti/claim/roles" => ["Learner"],
+        }
+      )
+
+      auth_hash = env["omniauth.auth"]
+
+      expect(auth_hash.uid).to eq("user-42")
+      expect(auth_hash.info.email).to eq("student@example.edu")
+      expect(auth_hash.extra.context_id).to eq("course-123")
+      expect(auth_hash.extra.context_name).to eq("TEST101")
+      expect(auth_hash.extra.consumer.context_label).to eq("TEST101")
+      expect(auth_hash.extra.context_title).to eq("Introduction to Testing")
+      expect(auth_hash.extra.roles).to eq(["Learner"])
+    end
+
+    it "rejects a token whose deployment_id isn't registered for the platform" do
+      response, env = perform_full_launch(
+        platforms: [canvas_platform],
+        issuer: canvas_platform[:issuer],
+        client_id: canvas_platform[:client_id],
+        extra_claims: {
+          "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => "some-unregistered-deployment",
+        }
+      )
+
+      expect(env).to be_nil # call_app! (the downstream/protected app) never ran
+      expect(response.status).to eq(302)
+      expect(response.location).to start_with("/auth/failure")
+    end
+
+    it "rejects a token missing deployment_id entirely" do
+      response, env = perform_full_launch(
+        platforms: [canvas_platform], issuer: canvas_platform[:issuer], client_id: canvas_platform[:client_id]
+      )
+
+      expect(env).to be_nil # call_app! (the downstream/protected app) never ran
+      expect(response.status).to eq(302)
+      expect(response.location).to start_with("/auth/failure")
+    end
+
+    it "rejects a token with a blank/missing sub (relying on the base gem's attr_required check)" do
+      response, env = perform_full_launch(
+        platforms: [canvas_platform],
+        issuer: canvas_platform[:issuer],
+        client_id: canvas_platform[:client_id],
+        extra_claims: {
+          sub: nil,
+          "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first,
+        }
+      )
+
+      expect(env).to be_nil # call_app! (the downstream/protected app) never ran
+      expect(response.status).to eq(302)
+      expect(response.location).to start_with("/auth/failure")
+    end
+  end
+
+  describe "#build_auth_hash (private; exercised directly for the context label/title precedence matrix)" do
+    def claims_with_context(context)
+      {
+        "sub" => "user-42",
+        "email" => "student@example.edu",
+        "https://purl.imsglobal.org/spec/lti/claim/context" => context,
+      }
+    end
+
+    it "prefers label over title for context_name when both are present " \
+       "(guards against mapping title instead)" do
+      claims = claims_with_context("id" => "course-123", "label" => "TEST101", "title" => "Intro to Testing")
+      auth_hash = strategy.send(:build_auth_hash, claims)
+
+      expect(auth_hash.extra.context_name).to eq("TEST101")
+      expect(auth_hash.extra.context_title).to eq("Intro to Testing")
+      expect(auth_hash.extra.consumer.context_label).to eq("TEST101")
+    end
+
+    it "creates a Course from label alone" do
+      claims = claims_with_context("id" => "course-123", "label" => "TEST101")
+      auth_hash = strategy.send(:build_auth_hash, claims)
+
+      expect(auth_hash.extra.context_name).to eq("TEST101")
+    end
+
+    it "falls back to title when label is absent, so the Course isn't lost" do
+      claims = claims_with_context("id" => "course-123", "title" => "Intro to Testing")
+      auth_hash = strategy.send(:build_auth_hash, claims)
+
+      expect(auth_hash.extra.context_name).to eq("Intro to Testing")
+    end
+
+    it "is an explicit nil (not an absent key) when the context claim carries neither label nor title, " \
+       "and does not create a Course" do
+      claims = claims_with_context("id" => "course-123")
+      auth_hash = strategy.send(:build_auth_hash, claims)
+
+      expect(auth_hash.extra.key?("context_name")).to be true
+      expect(auth_hash.extra.context_name).to be_nil
+    end
+  end
 end
