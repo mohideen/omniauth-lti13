@@ -1,0 +1,14 @@
+/.bundle/
+/.yardoc
+/_yardoc/
+/coverage/
+/doc/
+/pkg/
+/spec/reports/
+/tmp/
+/.rspec_status
+*.gem
+Gemfile.lock
+
+# Session/task prompt files — local-only, not part of the gem
+/lti-gem-prompt.md
