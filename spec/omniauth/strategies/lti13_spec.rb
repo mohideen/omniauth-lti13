@@ -170,17 +170,34 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
     OmniAuth.config.request_validation_phase = original_validation_phase
   end
 
-  # Drives a full launch through both legs (request phase, then callback)
-  # against a real self-signed id_token, sharing one session Hash across
-  # both Rack calls the way a browser's session cookie would. Returns the
-  # callback response and the env the downstream app received (so
-  # env["omniauth.auth"] can be inspected). By default the strategy is
-  # configured with client_jwk_signing_key (bypassing the jwks_uri network
-  # fetch); pass use_real_jwks_uri: true to exercise that fetch instead
-  # (stub it with WebMock at the platform's jwks_uri).
-  def perform_full_launch(platforms:, issuer:, client_id:, extra_claims: {},
-                           jwt_alg: :RS256, jwt_key: rsa_key, jwt_kid: nil, use_real_jwks_uri: false)
+  # Builds the Rack app + runs the request phase, leaving `session`
+  # populated with omniauth.state/omniauth.nonce/omniauth.lti13.iss the way
+  # a real request-phase redirect would. Returns [rack_app, session] so the
+  # callback leg can be driven separately (perform_callback_phase below),
+  # or driven more than once against the same session (replay tests).
+  def perform_request_phase(platforms:, issuer:, use_real_jwks_uri: false)
     session = {}
+    jwk_hash = jwk.to_h
+    rack_app = Rack::Builder.new do
+      strategy_options = { platforms: platforms }
+      strategy_options[:client_jwk_signing_key] = jwk_hash unless use_real_jwks_uri
+      use OmniAuth::Strategies::Lti13, **strategy_options
+      run ->(env) { [200, {}, ["ok"]] }
+    end.to_app
+
+    request_query = valid_initiation_params.merge(iss: issuer).map { |k, v| "#{k}=#{CGI.escape(v.to_s)}" }.join("&")
+    request_env = Rack::MockRequest.env_for("/auth/lti?#{request_query}", method: "POST", "rack.session" => session)
+    rack_app.call(request_env)
+
+    [rack_app, session]
+  end
+
+  # Posts id_token/state to the callback path against an already-built
+  # rack_app + session (from perform_request_phase). Returns the response
+  # and the env the downstream app received (so env["omniauth.auth"] can be
+  # inspected) -- swapping in a downstream app that captures its env, since
+  # the one built into rack_app during perform_request_phase doesn't.
+  def perform_callback_phase(platforms:, session:, id_token:, state:, use_real_jwks_uri: false)
     downstream_env = nil
     jwk_hash = jwk.to_h
     rack_app = Rack::Builder.new do
@@ -193,9 +210,28 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
       end
     end.to_app
 
-    request_query = valid_initiation_params.merge(iss: issuer).map { |k, v| "#{k}=#{CGI.escape(v.to_s)}" }.join("&")
-    request_env = Rack::MockRequest.env_for("/auth/lti?#{request_query}", method: "POST", "rack.session" => session)
-    rack_app.call(request_env)
+    callback_query = { id_token: id_token, state: state }.map { |k, v| "#{k}=#{CGI.escape(v.to_s)}" }.join("&")
+    callback_env = Rack::MockRequest.env_for(
+      "/auth/lti/callback?#{callback_query}", method: "POST", "rack.session" => session
+    )
+    callback_response = Rack::MockResponse.new(*rack_app.call(callback_env))
+
+    [callback_response, downstream_env]
+  end
+
+  # Drives a full launch through both legs (request phase, then callback)
+  # against a real self-signed id_token, sharing one session Hash across
+  # both Rack calls the way a browser's session cookie would. Returns the
+  # callback response, the env the downstream app received, and the
+  # session Hash (so replay-style tests can drive a second callback against
+  # the same, now-partially-consumed, session). By default the strategy is
+  # configured with client_jwk_signing_key (bypassing the jwks_uri network
+  # fetch); pass use_real_jwks_uri: true to exercise that fetch instead
+  # (stub it with WebMock at the platform's jwks_uri).
+  def perform_full_launch(platforms:, issuer:, client_id:, extra_claims: {},
+                           jwt_alg: :RS256, jwt_key: rsa_key, jwt_kid: nil, use_real_jwks_uri: false,
+                           state_override: nil, nonce_override: nil)
+    _rack_app, session = perform_request_phase(platforms: platforms, issuer: issuer, use_real_jwks_uri: use_real_jwks_uri)
 
     claims = {
       iss: issuer,
@@ -203,18 +239,19 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
       aud: client_id,
       exp: (Time.now + 300).to_i,
       iat: Time.now.to_i,
-      nonce: session["omniauth.nonce"],
+      nonce: nonce_override || session["omniauth.nonce"],
     }.merge(extra_claims)
     id_token = build_id_token(claims, key: jwt_key, alg: jwt_alg, kid: jwt_kid)
 
-    callback_query = { id_token: id_token, state: session["omniauth.state"] }
-                      .map { |k, v| "#{k}=#{CGI.escape(v.to_s)}" }.join("&")
-    callback_env = Rack::MockRequest.env_for(
-      "/auth/lti/callback?#{callback_query}", method: "POST", "rack.session" => session
+    response, env = perform_callback_phase(
+      platforms: platforms,
+      session: session,
+      id_token: id_token,
+      state: state_override || session["omniauth.state"],
+      use_real_jwks_uri: use_real_jwks_uri
     )
-    callback_response = Rack::MockResponse.new(*rack_app.call(callback_env))
 
-    [callback_response, downstream_env]
+    [response, env, session]
   end
 
   describe "callback phase (full launch)" do
@@ -271,7 +308,7 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
       expect(response.location).to start_with("/auth/failure")
     end
 
-    it "rejects a token with a blank/missing sub (relying on the base gem's attr_required check)" do
+    it "rejects a token with a missing sub (relying on the base gem's attr_required check)" do
       response, env = perform_full_launch(
         platforms: [canvas_platform],
         issuer: canvas_platform[:issuer],
@@ -285,6 +322,100 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
       expect(env).to be_nil # call_app! (the downstream/protected app) never ran
       expect(response.status).to eq(302)
       expect(response.location).to start_with("/auth/failure")
+    end
+
+    it "rejects a token with a blank (empty string) sub" do
+      response, env = perform_full_launch(
+        platforms: [canvas_platform],
+        issuer: canvas_platform[:issuer],
+        client_id: canvas_platform[:client_id],
+        extra_claims: {
+          sub: "",
+          "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first,
+        }
+      )
+
+      expect(env).to be_nil # call_app! (the downstream/protected app) never ran
+      expect(response.status).to eq(302)
+      expect(response.location).to start_with("/auth/failure")
+    end
+
+    it "populates info.email as an explicit nil, without erroring, when the email claim is absent" do
+      _response, env = perform_full_launch(
+        platforms: [canvas_platform],
+        issuer: canvas_platform[:issuer],
+        client_id: canvas_platform[:client_id],
+        extra_claims: {
+          "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first,
+        }
+      )
+
+      auth_hash = env["omniauth.auth"]
+      expect(auth_hash).not_to be_nil
+      expect(auth_hash.info.key?("email")).to be true
+      expect(auth_hash.info.email).to be_nil
+    end
+  end
+
+  describe "nonce/state replay protection (via omniauth_openid_connect)" do
+    it "rejects a callback whose state doesn't match what was stored during the request phase" do
+      response, env = perform_full_launch(
+        platforms: [canvas_platform],
+        issuer: canvas_platform[:issuer],
+        client_id: canvas_platform[:client_id],
+        extra_claims: { "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first },
+        state_override: "forged-state-value"
+      )
+
+      expect(env).to be_nil
+      expect(response.status).to eq(302)
+      expect(response.location).to start_with("/auth/failure")
+    end
+
+    it "rejects a callback whose id_token nonce doesn't match what was stored during the request phase" do
+      response, env = perform_full_launch(
+        platforms: [canvas_platform],
+        issuer: canvas_platform[:issuer],
+        client_id: canvas_platform[:client_id],
+        extra_claims: { "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first },
+        nonce_override: "forged-nonce-value"
+      )
+
+      expect(env).to be_nil
+      expect(response.status).to eq(302)
+      expect(response.location).to start_with("/auth/failure")
+    end
+
+    it "rejects a second callback that replays the same state/nonce (both are session.delete-based, one-time use)" do
+      platforms = [canvas_platform]
+      _rack_app, session = perform_request_phase(platforms: platforms, issuer: canvas_platform[:issuer])
+      state = session["omniauth.state"]
+      nonce = session["omniauth.nonce"]
+
+      claims = {
+        iss: canvas_platform[:issuer],
+        sub: "user-42",
+        aud: canvas_platform[:client_id],
+        exp: (Time.now + 300).to_i,
+        iat: Time.now.to_i,
+        nonce: nonce,
+        "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first,
+      }
+      id_token = build_id_token(claims)
+
+      first_response, first_env = perform_callback_phase(
+        platforms: platforms, session: session, id_token: id_token, state: state
+      )
+      expect(first_env["omniauth.auth"]).not_to be_nil
+      expect(first_response.status).to eq(200)
+
+      second_response, second_env = perform_callback_phase(
+        platforms: platforms, session: session, id_token: id_token, state: state
+      )
+
+      expect(second_env).to be_nil
+      expect(second_response.status).to eq(302)
+      expect(second_response.location).to start_with("/auth/failure")
     end
   end
 
