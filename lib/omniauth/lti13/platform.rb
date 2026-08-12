@@ -39,10 +39,7 @@ module OmniAuth
       private
 
       def validate_required_attributes!
-        missing = REQUIRED_ATTRIBUTES.select do |attr|
-          value = public_send(attr)
-          value.respond_to?(:empty?) && value.empty?
-        end
+        missing = REQUIRED_ATTRIBUTES.select { |attr| public_send(attr).blank? }
 
         raise ArgumentError, "Platform missing required attribute(s): #{missing.join(', ')}" if missing.any?
       end

@@ -69,27 +69,50 @@ module OmniAuth
       # The Platform resolved for the current request by setup_phase.
       attr_reader :current_platform
 
+      # Built once, when the middleware is constructed, rather than lazily
+      # via the more usual `@ivar ||=` memoized-reader pattern: OmniAuth's
+      # Strategy#call does `dup.call!(env)`, handing every request a fresh
+      # duped instance, so a `||=` inside a per-request method (e.g.
+      # setup_phase) would never actually survive across requests -- it'd
+      # rebuild the registry (and revalidate every configured Platform's
+      # attributes) on every single launch and callback. Building it here
+      # instead means it's computed once and carried into every dup via
+      # Ruby's normal shallow ivar copy.
+      def initialize(app, *args, &block)
+        super
+        @platform_registry = OmniAuth::Lti13::PlatformRegistry.new(options.platforms)
+      end
+
       # Runs before both request_phase and callback_phase. Selects
       # `client_options`/`issuer` for this request based on the incoming
       # `iss`, looked up against the registered `:platforms` list. An
       # unregistered issuer raises rather than falling back to a default;
       # the raise propagates out through OmniAuth::Strategy#call!'s own
       # rescue, which turns it into a standard OmniAuth failure response.
-      # On the request-phase leg only, also validates the login-initiation
-      # request itself (required params present, client_id consistent).
       def setup_phase
         platform = platform_registry.find_by_issuer(current_iss)
         raise OmniAuth::Lti13::UnregisteredPlatformError, current_iss unless platform
-
-        if on_request_path?
-          validate_login_initiation!(platform)
-          session["omniauth.lti13.iss"] = platform.issuer
-        end
 
         apply_platform!(platform)
       end
 
       private
+
+      attr_reader :platform_registry
+
+      # Overrides OmniAuth::Strategies::OpenIDConnect#request_phase to
+      # validate the login-initiation request itself (required params
+      # present, client_id consistent) and stash the resolved issuer in the
+      # session for the callback leg to find, before delegating to the base
+      # class's actual redirect-building logic. These are request-phase-only
+      # concerns, so they belong here rather than in setup_phase (which runs
+      # for both phases and should only do the platform resolution both
+      # legs genuinely share).
+      def request_phase
+        validate_login_initiation!(current_platform)
+        session["omniauth.lti13.iss"] = current_platform.issuer
+        super
+      end
 
       # Overrides OmniAuth::Strategies::OpenIDConnect#id_token_callback_phase
       # (the callback path taken when response_type is "id_token", which is
@@ -154,7 +177,7 @@ module OmniAuth
       def validate_claims!(decoded)
         skew = options.clock_skew.to_i
         now = Time.now.to_i
-        expected_nonce = params["nonce"].to_s.empty? ? stored_nonce : params["nonce"]
+        expected_nonce = params["nonce"].presence || stored_nonce
 
         unless decoded.iss == options.issuer
           raise OmniAuth::Lti13::InvalidIdTokenError, "iss #{decoded.iss.inspect} does not match expected issuer"
@@ -178,7 +201,7 @@ module OmniAuth
       # needs checking when present, to disambiguate an aud with multiple
       # values. OmniAuth::Strategies::OpenIDConnect doesn't check it at all.
       def validate_azp!(decoded)
-        return if decoded.azp.to_s.empty?
+        return if decoded.azp.blank?
         return if decoded.azp == client_options.identifier
 
         raise OmniAuth::Lti13::InvalidAzpError.new(decoded.azp, client_options.identifier)
@@ -194,10 +217,6 @@ module OmniAuth
         session["omniauth.lti13.iss"] || request.params["iss"]
       end
 
-      def platform_registry
-        @platform_registry ||= OmniAuth::Lti13::PlatformRegistry.new(options.platforms)
-      end
-
       # Rejecting a malformed login-initiation request here, before ever
       # redirecting the browser to the Platform, gives a clear tool-side
       # error instead of silently sending an authorize request that's
@@ -205,7 +224,7 @@ module OmniAuth
       def validate_login_initiation!(platform)
         validate_client_id!(platform)
 
-        missing = REQUIRED_INITIATION_PARAMS.select { |param| request.params[param].to_s.empty? }
+        missing = REQUIRED_INITIATION_PARAMS.select { |param| request.params[param].blank? }
         raise OmniAuth::Lti13::InvalidLoginInitiationError, missing unless missing.empty?
       end
 
@@ -215,7 +234,7 @@ module OmniAuth
       # actually wrong, never used to pick the platform in the first place.
       def validate_client_id!(platform)
         incoming_client_id = request.params["client_id"]
-        return if incoming_client_id.to_s.empty?
+        return if incoming_client_id.blank?
         return if incoming_client_id == platform.client_id
 
         raise OmniAuth::Lti13::ClientIdMismatchError.new(platform.client_id, incoming_client_id)
@@ -251,8 +270,8 @@ module OmniAuth
       # LTI-specific alike.
       def build_auth_hash(claims)
         context = claims[OmniAuth::Lti13::Claims::CONTEXT] || {}
-        label = presence(context["label"])
-        title = presence(context["title"])
+        label = context["label"].presence
+        title = context["title"].presence
 
         AuthHash.new(
           provider: name,
@@ -273,13 +292,6 @@ module OmniAuth
             roles: claims[OmniAuth::Lti13::Claims::ROLES],
           }
         )
-      end
-
-      def presence(value)
-        return nil if value.nil?
-        return nil if value.respond_to?(:empty?) && value.empty?
-
-        value
       end
     end
   end

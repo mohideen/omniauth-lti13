@@ -14,7 +14,7 @@ module OmniAuth
       end
 
       def find_by_issuer(issuer)
-        return nil if issuer.to_s.empty?
+        return nil if issuer.blank?
 
         @platforms_by_issuer[issuer]
       end

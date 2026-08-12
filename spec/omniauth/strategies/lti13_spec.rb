@@ -38,6 +38,49 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
     }
   end
 
+  let(:base_deployment_claim) do
+    { "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first }
+  end
+
+  around do |example|
+    original_validation_phase = OmniAuth.config.request_validation_phase
+    OmniAuth.config.request_validation_phase = nil
+    example.run
+    OmniAuth.config.request_validation_phase = original_validation_phase
+  end
+
+  def to_query(params)
+    params.map { |k, v| "#{k}=#{CGI.escape(v.to_s)}" }.join("&")
+  end
+
+  # Builds the Rack app under test: this strategy mounted with the given
+  # platforms, backed by a downstream app (defaulting to a plain 200) that
+  # can be swapped in via a block to capture the env it received. By
+  # default the strategy is configured with client_jwk_signing_key
+  # (bypassing the jwks_uri network fetch); pass use_real_jwks_uri: true to
+  # exercise that fetch instead (stub it with WebMock at the platform's
+  # jwks_uri).
+  def build_rack_app(platforms:, use_real_jwks_uri: false, &downstream)
+    jwk_hash = jwk.to_h
+    downstream_app = downstream || ->(_env) { [200, {}, ["ok"]] }
+
+    Rack::Builder.new do
+      strategy_options = { platforms: platforms }
+      strategy_options[:client_jwk_signing_key] = jwk_hash unless use_real_jwks_uri
+      use OmniAuth::Strategies::Lti13, **strategy_options
+      run downstream_app
+    end.to_app
+  end
+
+  # Shared assertion for the many failure-path tests below: the launch was
+  # rejected before ever reaching the downstream/protected app, and the
+  # response is the standard OmniAuth failure redirect.
+  def expect_launch_rejected(response, env)
+    expect(env).to be_nil
+    expect(response.status).to eq(302)
+    expect(response.location).to start_with("/auth/failure")
+  end
+
   it "is a subclass of OmniAuth::Strategies::OpenIDConnect" do
     expect(described_class.superclass).to eq(OmniAuth::Strategies::OpenIDConnect)
   end
@@ -57,13 +100,8 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
     # test routing/resolution, not that concern.
 
     def post_to_request_phase(platforms:, params:)
-      rack_app = Rack::Builder.new do
-        use OmniAuth::Strategies::Lti13, platforms: platforms
-        run ->(_env) { [404, {}, ["Not Found"]] }
-      end.to_app
-
-      query = params.map { |k, v| "#{k}=#{CGI.escape(v.to_s)}" }.join("&")
-      env = Rack::MockRequest.env_for("/auth/lti?#{query}", method: "POST", "rack.session" => {})
+      rack_app = build_rack_app(platforms: platforms)
+      env = Rack::MockRequest.env_for("/auth/lti?#{to_query(params)}", method: "POST", "rack.session" => {})
       Rack::MockResponse.new(*rack_app.call(env))
     end
 
@@ -163,13 +201,6 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
     end
   end
 
-  around do |example|
-    original_validation_phase = OmniAuth.config.request_validation_phase
-    OmniAuth.config.request_validation_phase = nil
-    example.run
-    OmniAuth.config.request_validation_phase = original_validation_phase
-  end
-
   # Builds the Rack app + runs the request phase, leaving `session`
   # populated with omniauth.state/omniauth.nonce/omniauth.lti13.iss the way
   # a real request-phase redirect would. Returns [rack_app, session] so the
@@ -177,42 +208,29 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
   # or driven more than once against the same session (replay tests).
   def perform_request_phase(platforms:, issuer:, use_real_jwks_uri: false)
     session = {}
-    jwk_hash = jwk.to_h
-    rack_app = Rack::Builder.new do
-      strategy_options = { platforms: platforms }
-      strategy_options[:client_jwk_signing_key] = jwk_hash unless use_real_jwks_uri
-      use OmniAuth::Strategies::Lti13, **strategy_options
-      run ->(env) { [200, {}, ["ok"]] }
-    end.to_app
+    rack_app = build_rack_app(platforms: platforms, use_real_jwks_uri: use_real_jwks_uri)
 
-    request_query = valid_initiation_params.merge(iss: issuer).map { |k, v| "#{k}=#{CGI.escape(v.to_s)}" }.join("&")
-    request_env = Rack::MockRequest.env_for("/auth/lti?#{request_query}", method: "POST", "rack.session" => session)
+    request_env = Rack::MockRequest.env_for(
+      "/auth/lti?#{to_query(valid_initiation_params.merge(iss: issuer))}", method: "POST", "rack.session" => session
+    )
     rack_app.call(request_env)
 
     [rack_app, session]
   end
 
-  # Posts id_token/state to the callback path against an already-built
-  # rack_app + session (from perform_request_phase). Returns the response
-  # and the env the downstream app received (so env["omniauth.auth"] can be
-  # inspected) -- swapping in a downstream app that captures its env, since
-  # the one built into rack_app during perform_request_phase doesn't.
+  # Posts id_token/state to the callback path against a freshly-built rack
+  # app sharing the given session (from perform_request_phase). Returns the
+  # response and the env the downstream app received (so
+  # env["omniauth.auth"] can be inspected).
   def perform_callback_phase(platforms:, session:, id_token:, state:, use_real_jwks_uri: false)
     downstream_env = nil
-    jwk_hash = jwk.to_h
-    rack_app = Rack::Builder.new do
-      strategy_options = { platforms: platforms }
-      strategy_options[:client_jwk_signing_key] = jwk_hash unless use_real_jwks_uri
-      use OmniAuth::Strategies::Lti13, **strategy_options
-      run ->(env) do
-        downstream_env = env
-        [200, {}, ["ok"]]
-      end
-    end.to_app
+    rack_app = build_rack_app(platforms: platforms, use_real_jwks_uri: use_real_jwks_uri) do |env|
+      downstream_env = env
+      [200, {}, ["ok"]]
+    end
 
-    callback_query = { id_token: id_token, state: state }.map { |k, v| "#{k}=#{CGI.escape(v.to_s)}" }.join("&")
     callback_env = Rack::MockRequest.env_for(
-      "/auth/lti/callback?#{callback_query}", method: "POST", "rack.session" => session
+      "/auth/lti/callback?#{to_query(id_token: id_token, state: state)}", method: "POST", "rack.session" => session
     )
     callback_response = Rack::MockResponse.new(*rack_app.call(callback_env))
 
@@ -224,10 +242,7 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
   # both Rack calls the way a browser's session cookie would. Returns the
   # callback response, the env the downstream app received, and the
   # session Hash (so replay-style tests can drive a second callback against
-  # the same, now-partially-consumed, session). By default the strategy is
-  # configured with client_jwk_signing_key (bypassing the jwks_uri network
-  # fetch); pass use_real_jwks_uri: true to exercise that fetch instead
-  # (stub it with WebMock at the platform's jwks_uri).
+  # the same, now-partially-consumed, session).
   def perform_full_launch(platforms:, issuer:, client_id:, extra_claims: {},
                            jwt_alg: :RS256, jwt_key: rsa_key, jwt_kid: nil, use_real_jwks_uri: false,
                            state_override: nil, nonce_override: nil)
@@ -260,16 +275,15 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
         platforms: [canvas_platform],
         issuer: canvas_platform[:issuer],
         client_id: canvas_platform[:client_id],
-        extra_claims: {
+        extra_claims: base_deployment_claim.merge(
           email: "student@example.edu",
-          "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first,
           "https://purl.imsglobal.org/spec/lti/claim/context" => {
             "id" => "course-123",
             "label" => "TEST101",
             "title" => "Introduction to Testing",
           },
-          "https://purl.imsglobal.org/spec/lti/claim/roles" => ["Learner"],
-        }
+          "https://purl.imsglobal.org/spec/lti/claim/roles" => ["Learner"]
+        )
       )
 
       auth_hash = env["omniauth.auth"]
@@ -293,9 +307,7 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
         }
       )
 
-      expect(env).to be_nil # call_app! (the downstream/protected app) never ran
-      expect(response.status).to eq(302)
-      expect(response.location).to start_with("/auth/failure")
+      expect_launch_rejected(response, env)
     end
 
     it "rejects a token missing deployment_id entirely" do
@@ -303,9 +315,7 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
         platforms: [canvas_platform], issuer: canvas_platform[:issuer], client_id: canvas_platform[:client_id]
       )
 
-      expect(env).to be_nil # call_app! (the downstream/protected app) never ran
-      expect(response.status).to eq(302)
-      expect(response.location).to start_with("/auth/failure")
+      expect_launch_rejected(response, env)
     end
 
     it "rejects a token with a missing sub (relying on the base gem's attr_required check)" do
@@ -313,15 +323,10 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
         platforms: [canvas_platform],
         issuer: canvas_platform[:issuer],
         client_id: canvas_platform[:client_id],
-        extra_claims: {
-          sub: nil,
-          "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first,
-        }
+        extra_claims: base_deployment_claim.merge(sub: nil)
       )
 
-      expect(env).to be_nil # call_app! (the downstream/protected app) never ran
-      expect(response.status).to eq(302)
-      expect(response.location).to start_with("/auth/failure")
+      expect_launch_rejected(response, env)
     end
 
     it "rejects a token with a blank (empty string) sub" do
@@ -329,15 +334,10 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
         platforms: [canvas_platform],
         issuer: canvas_platform[:issuer],
         client_id: canvas_platform[:client_id],
-        extra_claims: {
-          sub: "",
-          "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first,
-        }
+        extra_claims: base_deployment_claim.merge(sub: "")
       )
 
-      expect(env).to be_nil # call_app! (the downstream/protected app) never ran
-      expect(response.status).to eq(302)
-      expect(response.location).to start_with("/auth/failure")
+      expect_launch_rejected(response, env)
     end
 
     it "populates info.email as an explicit nil, without erroring, when the email claim is absent" do
@@ -345,9 +345,7 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
         platforms: [canvas_platform],
         issuer: canvas_platform[:issuer],
         client_id: canvas_platform[:client_id],
-        extra_claims: {
-          "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first,
-        }
+        extra_claims: base_deployment_claim
       )
 
       auth_hash = env["omniauth.auth"]
@@ -363,13 +361,11 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
         platforms: [canvas_platform],
         issuer: canvas_platform[:issuer],
         client_id: canvas_platform[:client_id],
-        extra_claims: { "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first },
+        extra_claims: base_deployment_claim,
         state_override: "forged-state-value"
       )
 
-      expect(env).to be_nil
-      expect(response.status).to eq(302)
-      expect(response.location).to start_with("/auth/failure")
+      expect_launch_rejected(response, env)
     end
 
     it "rejects a callback whose id_token nonce doesn't match what was stored during the request phase" do
@@ -377,20 +373,16 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
         platforms: [canvas_platform],
         issuer: canvas_platform[:issuer],
         client_id: canvas_platform[:client_id],
-        extra_claims: { "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first },
+        extra_claims: base_deployment_claim,
         nonce_override: "forged-nonce-value"
       )
 
-      expect(env).to be_nil
-      expect(response.status).to eq(302)
-      expect(response.location).to start_with("/auth/failure")
+      expect_launch_rejected(response, env)
     end
 
     it "rejects a second callback that replays the same state/nonce (both are session.delete-based, one-time use)" do
       platforms = [canvas_platform]
       _rack_app, session = perform_request_phase(platforms: platforms, issuer: canvas_platform[:issuer])
-      state = session["omniauth.state"]
-      nonce = session["omniauth.nonce"]
 
       claims = {
         iss: canvas_platform[:issuer],
@@ -398,10 +390,10 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
         aud: canvas_platform[:client_id],
         exp: (Time.now + 300).to_i,
         iat: Time.now.to_i,
-        nonce: nonce,
-        "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first,
-      }
+        nonce: session["omniauth.nonce"],
+      }.merge(base_deployment_claim)
       id_token = build_id_token(claims)
+      state = session["omniauth.state"]
 
       first_response, first_env = perform_callback_phase(
         platforms: platforms, session: session, id_token: id_token, state: state
@@ -413,9 +405,7 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
         platforms: platforms, session: session, id_token: id_token, state: state
       )
 
-      expect(second_env).to be_nil
-      expect(second_response.status).to eq(302)
-      expect(second_response.location).to start_with("/auth/failure")
+      expect_launch_rejected(second_response, second_env)
     end
   end
 
@@ -463,10 +453,6 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
   end
 
   describe "security hardening" do
-    let(:base_deployment_claim) do
-      { "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first }
-    end
-
     describe "JWT algorithm allowlist" do
       it "rejects alg: none (the classic unsigned-token forgery vector)" do
         response, env = perform_full_launch(
@@ -477,9 +463,7 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
           jwt_alg: :none
         )
 
-        expect(env).to be_nil
-        expect(response.status).to eq(302)
-        expect(response.location).to start_with("/auth/failure")
+        expect_launch_rejected(response, env)
       end
 
       it "rejects an algorithm outside the allowlist even when the token is validly signed" do
@@ -492,9 +476,7 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
           jwt_key: "shared-secret-no-real-platform-would-use-for-lti"
         )
 
-        expect(env).to be_nil
-        expect(response.status).to eq(302)
-        expect(response.location).to start_with("/auth/failure")
+        expect_launch_rejected(response, env)
       end
     end
 
@@ -507,9 +489,7 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
           extra_claims: base_deployment_claim.merge(exp: Time.now.to_i - 90)
         )
 
-        expect(env).to be_nil
-        expect(response.status).to eq(302)
-        expect(response.location).to start_with("/auth/failure")
+        expect_launch_rejected(response, env)
       end
 
       it "accepts a token expired within the skew tolerance" do
@@ -531,9 +511,7 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
           extra_claims: base_deployment_claim.merge(iat: Time.now.to_i + 120)
         )
 
-        expect(env).to be_nil
-        expect(response.status).to eq(302)
-        expect(response.location).to start_with("/auth/failure")
+        expect_launch_rejected(response, env)
       end
     end
 
@@ -546,9 +524,7 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
           extra_claims: base_deployment_claim.merge(azp: "some-other-client-id")
         )
 
-        expect(env).to be_nil
-        expect(response.status).to eq(302)
-        expect(response.location).to start_with("/auth/failure")
+        expect_launch_rejected(response, env)
       end
 
       it "accepts a token whose azp matches the resolved platform's client_id" do
@@ -606,9 +582,7 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
           use_real_jwks_uri: true
         )
 
-        expect(env).to be_nil
-        expect(response.status).to eq(302)
-        expect(response.location).to start_with("/auth/failure")
+        expect_launch_rejected(response, env)
       end
     end
   end
