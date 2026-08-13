@@ -61,9 +61,10 @@ config.omniauth :lti,
 
 A single instance of this gem may need to trust more than one LTI Platform -- e.g. several
 Canvas accounts, or Canvas plus Blackboard. `client_options`/`issuer` therefore can't be static
-strategy-wide config; they're resolved per-request, keyed on the incoming `iss`, against the
-`:platforms` option. **This schema is this gem's to define**, and is the primary interface
-boundary with whatever host app populates it (for Avalon, from `settings.yml`).
+strategy-wide config; they're resolved per-request, keyed on the incoming `iss` (and, when
+needed, `client_id` -- see below), against the `:platforms` option. **This schema is this gem's
+to define**, and is the primary interface boundary with whatever host app populates it (for
+Avalon, from `settings.yml`).
 
 `:platforms` is an Array of Hashes (or `OmniAuth::Lti13::Platform` instances), each with:
 
@@ -71,7 +72,7 @@ boundary with whatever host app populates it (for Avalon, from `settings.yml`).
 |----------------------------|------------------|----------|-------------------------------------------------------------------------------|
 | `issuer`                  | String           | yes      | The Platform's `iss` value. Used to select this entry.                       |
 | `client_id`                | String           | yes      | This tool's client_id as registered with the Platform.                       |
-| `deployment_ids`           | Array\<String\>  | yes      | Every deployment_id this Platform is allowed to launch with. A Platform can have more than one deployment of the same tool registration. |
+| `deployment_ids`           | Array\<String or Integer\> | yes | Every deployment_id this Platform is allowed to launch with. A Platform can have more than one deployment of the same tool registration. Compared against the token's deployment_id claim as strings, so an unquoted numeric YAML value (`deployment_ids: [1]`) works the same as a quoted one. |
 | `authorization_endpoint`  | String           | yes      | The Platform's OIDC authorization endpoint (where the login redirect goes).   |
 | `jwks_uri`                 | String           | yes      | The Platform's JWKS endpoint, for verifying id_token signatures.             |
 | `redirect_uri`              | String           | yes      | This tool's registered callback URL for this Platform (`.../users/auth/lti/callback`). |
@@ -80,6 +81,24 @@ An `iss` that doesn't match any registered platform is **rejected**, not silentl
 matched against a default. A `client_id` mismatch (when the login-initiation request happens to
 include one) and a `deployment_id` mismatch (from the verified id_token) are rejected the same
 way.
+
+**LTI identity is `(issuer, client_id, deployment_id)`, not `issuer` alone.** Canvas Cloud, for
+example, uses a single shared issuer (`https://canvas.instructure.com`) across *every* tenant --
+the exact issuer in the example above -- so two Canvas tenants can only both be registered here
+if `client_id` disambiguates between them:
+
+```ruby
+platforms: [
+  { issuer: "https://canvas.instructure.com", client_id: "tenant-a-client-id", ... },
+  { issuer: "https://canvas.instructure.com", client_id: "tenant-b-client-id", ... },
+]
+```
+
+Two registrations sharing the exact same `(issuer, client_id)` pair raise `ArgumentError` at
+strategy-construction time. When an issuer matches more than one registration, the
+login-initiation request's `client_id` param (RECOMMENDED by the IMS Security Framework for
+exactly this case) picks the right one; if it's missing, resolution is genuinely ambiguous and
+the launch is rejected (`OmniAuth::Lti13::AmbiguousPlatformError`) rather than guessing.
 
 ### `clock_skew` (optional)
 
@@ -140,8 +159,12 @@ initializer, not here:
 - **JWKS rotation**: if the id_token's `kid` isn't found in the fetched JWKS, the JWKS is
   re-fetched once and verification retried, so a Platform that rotates its signing key doesn't
   fail every launch until something else happens to trigger a re-fetch.
-- **Nonce/state replay protection** via `omniauth_openid_connect`: both are session-based,
-  one-time-use values.
+- **Nonce/state replay protection**: both are session-based, one-time-use values. `state` is
+  validated by `omniauth_openid_connect`; `nonce` is validated by this gem against the
+  session-stored value only -- a `nonce` *request* param is never honored, since a real LTI
+  Authentication Response never carries one (only `id_token` and `state` do) and JWTs aren't
+  encrypted, so anyone holding a captured `id_token` could otherwise read its `nonce` claim and
+  echo it back as a param to replay that token into a session of their own.
 - **`response_mode=form_post`**, per the IMS Security Framework.
 
 ## Development

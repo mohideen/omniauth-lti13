@@ -60,5 +60,14 @@ RSpec.describe OmniAuth::Lti13::Platform do
 
       expect(platform.deployment_id?("unknown-deployment")).to be false
     end
+
+    it "matches regardless of whether the configured id is a String or an Integer -- unquoted YAML " \
+       "config (e.g. `deployment_ids: [1]`) parses a numeric-looking id as an Integer, but the LTI " \
+       "deployment_id claim is always a String" do
+      platform = described_class.new(**attrs.merge(deployment_ids: [1, "2"]))
+
+      expect(platform.deployment_id?("1")).to be true
+      expect(platform.deployment_id?(2)).to be true
+    end
   end
 end

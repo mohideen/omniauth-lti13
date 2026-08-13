@@ -130,6 +130,34 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
       expect(response.location).to start_with(blackboard_platform[:authorization_endpoint])
     end
 
+    it "disambiguates by client_id when multiple platforms share an issuer " \
+       "(e.g. Canvas Cloud's shared issuer across tenants)" do
+      tenant_a = canvas_platform.merge(client_id: "tenant-a", authorization_endpoint: "https://canvas.example.edu/a")
+      tenant_b = canvas_platform.merge(client_id: "tenant-b", authorization_endpoint: "https://canvas.example.edu/b")
+
+      response = post_to_request_phase(
+        platforms: [tenant_a, tenant_b],
+        params: valid_initiation_params.merge(iss: canvas_platform[:issuer], client_id: "tenant-b")
+      )
+
+      expect(response.status).to eq(302)
+      expect(response.location).to start_with(tenant_b[:authorization_endpoint])
+    end
+
+    it "rejects a launch when multiple platforms share an issuer and client_id is omitted, " \
+       "rather than guessing which one is meant" do
+      tenant_a = canvas_platform.merge(client_id: "tenant-a")
+      tenant_b = canvas_platform.merge(client_id: "tenant-b")
+
+      response = post_to_request_phase(
+        platforms: [tenant_a, tenant_b],
+        params: valid_initiation_params.merge(iss: canvas_platform[:issuer])
+      )
+
+      expect(response.status).to eq(302)
+      expect(response.location).to start_with("/auth/failure")
+    end
+
     it "rejects a launch from an unregistered iss instead of falling back to a default" do
       response = post_to_request_phase(
         platforms: [canvas_platform],
@@ -206,12 +234,14 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
   # a real request-phase redirect would. Returns [rack_app, session] so the
   # callback leg can be driven separately (perform_callback_phase below),
   # or driven more than once against the same session (replay tests).
-  def perform_request_phase(platforms:, issuer:, use_real_jwks_uri: false)
+  def perform_request_phase(platforms:, issuer:, client_id: nil, use_real_jwks_uri: false)
     session = {}
     rack_app = build_rack_app(platforms: platforms, use_real_jwks_uri: use_real_jwks_uri)
 
+    initiation_params = valid_initiation_params.merge(iss: issuer)
+    initiation_params[:client_id] = client_id if client_id
     request_env = Rack::MockRequest.env_for(
-      "/auth/lti?#{to_query(valid_initiation_params.merge(iss: issuer))}", method: "POST", "rack.session" => session
+      "/auth/lti?#{to_query(initiation_params)}", method: "POST", "rack.session" => session
     )
     rack_app.call(request_env)
 
@@ -222,15 +252,16 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
   # app sharing the given session (from perform_request_phase). Returns the
   # response and the env the downstream app received (so
   # env["omniauth.auth"] can be inspected).
-  def perform_callback_phase(platforms:, session:, id_token:, state:, use_real_jwks_uri: false)
+  def perform_callback_phase(platforms:, session:, id_token:, state:, use_real_jwks_uri: false, extra_params: {})
     downstream_env = nil
     rack_app = build_rack_app(platforms: platforms, use_real_jwks_uri: use_real_jwks_uri) do |env|
       downstream_env = env
       [200, {}, ["ok"]]
     end
 
+    callback_query = to_query({ id_token: id_token, state: state }.merge(extra_params))
     callback_env = Rack::MockRequest.env_for(
-      "/auth/lti/callback?#{to_query(id_token: id_token, state: state)}", method: "POST", "rack.session" => session
+      "/auth/lti/callback?#{callback_query}", method: "POST", "rack.session" => session
     )
     callback_response = Rack::MockResponse.new(*rack_app.call(callback_env))
 
@@ -245,8 +276,10 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
   # the same, now-partially-consumed, session).
   def perform_full_launch(platforms:, issuer:, client_id:, extra_claims: {},
                            jwt_alg: :RS256, jwt_key: rsa_key, jwt_kid: nil, use_real_jwks_uri: false,
-                           state_override: nil, nonce_override: nil)
-    _rack_app, session = perform_request_phase(platforms: platforms, issuer: issuer, use_real_jwks_uri: use_real_jwks_uri)
+                           state_override: nil, nonce_override: nil, initiation_client_id: nil)
+    _rack_app, session = perform_request_phase(
+      platforms: platforms, issuer: issuer, client_id: initiation_client_id, use_real_jwks_uri: use_real_jwks_uri
+    )
 
     claims = {
       iss: issuer,
@@ -295,6 +328,25 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
       expect(auth_hash.extra.consumer.context_label).to eq("TEST101")
       expect(auth_hash.extra.context_title).to eq("Introduction to Testing")
       expect(auth_hash.extra.roles).to eq(["Learner"])
+    end
+
+    it "resolves the correct platform on the callback leg too, via the client_id stashed during the request " \
+       "phase, when multiple platforms share an issuer" do
+      tenant_a = canvas_platform.merge(client_id: "tenant-a", deployment_ids: ["tenant-a-deployment"])
+      tenant_b = canvas_platform.merge(client_id: "tenant-b", deployment_ids: ["tenant-b-deployment"])
+
+      _response, env = perform_full_launch(
+        platforms: [tenant_a, tenant_b],
+        issuer: canvas_platform[:issuer],
+        client_id: "tenant-b",
+        initiation_client_id: "tenant-b",
+        extra_claims: {
+          "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => "tenant-b-deployment",
+        }
+      )
+
+      expect(env["omniauth.auth"]).not_to be_nil
+      expect(env["omniauth.auth"].uid).to eq("user-42")
     end
 
     it "rejects a token whose deployment_id isn't registered for the platform" do
@@ -375,6 +427,39 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
         client_id: canvas_platform[:client_id],
         extra_claims: base_deployment_claim,
         nonce_override: "forged-nonce-value"
+      )
+
+      expect_launch_rejected(response, env)
+    end
+
+    it "does not honor a nonce request param, even one crafted to match the id_token's own nonce claim -- " \
+       "otherwise an attacker holding any captured id_token (JWTs aren't encrypted, so its nonce claim is " \
+       "trivially readable) could replay it into a session of their own by echoing that nonce back as a " \
+       "request param, defeating nonce-based replay protection" do
+      platforms = [canvas_platform]
+
+      # A token legitimately issued for some other (e.g. victim's) session.
+      _rack_app, other_session = perform_request_phase(platforms: platforms, issuer: canvas_platform[:issuer])
+      captured_claims = {
+        iss: canvas_platform[:issuer],
+        sub: "victim-user",
+        aud: canvas_platform[:client_id],
+        exp: (Time.now + 300).to_i,
+        iat: Time.now.to_i,
+        nonce: other_session["omniauth.nonce"],
+      }.merge(base_deployment_claim)
+      captured_id_token = build_id_token(captured_claims)
+      captured_nonce = other_session["omniauth.nonce"]
+
+      # Attacker's own session/request phase (its own state/nonce, unrelated to the captured token).
+      _rack_app, attacker_session = perform_request_phase(platforms: platforms, issuer: canvas_platform[:issuer])
+
+      response, env = perform_callback_phase(
+        platforms: platforms,
+        session: attacker_session,
+        id_token: captured_id_token,
+        state: attacker_session["omniauth.state"],
+        extra_params: { nonce: captured_nonce }
       )
 
       expect_launch_rejected(response, env)

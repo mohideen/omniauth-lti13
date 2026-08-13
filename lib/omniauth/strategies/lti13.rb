@@ -21,7 +21,9 @@ module OmniAuth
       # for the schema. A single instance may serve multiple LMS
       # deployments, so `client_options`/`issuer` can't be static
       # strategy-wide config; they're resolved per-request in setup_phase
-      # below, keyed on the incoming `iss`.
+      # below, keyed on the incoming `iss` and, when more than one
+      # registration shares an issuer (e.g. Canvas Cloud's shared
+      # https://canvas.instructure.com issuer across tenants), `client_id`.
       option :platforms, []
 
       # LTI 1.3 Core's launch flow is OIDC's implicit-style id_token flow,
@@ -85,13 +87,24 @@ module OmniAuth
 
       # Runs before both request_phase and callback_phase. Selects
       # `client_options`/`issuer` for this request based on the incoming
-      # `iss`, looked up against the registered `:platforms` list. An
-      # unregistered issuer raises rather than falling back to a default;
-      # the raise propagates out through OmniAuth::Strategy#call!'s own
-      # rescue, which turns it into a standard OmniAuth failure response.
+      # `iss` (and `client_id`, when needed to disambiguate), looked up
+      # against the registered `:platforms` list. An unregistered (or
+      # ambiguous) issuer raises rather than falling back to a default; the
+      # raise propagates out through OmniAuth::Strategy#call!'s own rescue,
+      # which turns it into a standard OmniAuth failure response.
       def setup_phase
-        platform = platform_registry.find_by_issuer(current_iss)
-        raise OmniAuth::Lti13::UnregisteredPlatformError, current_iss unless platform
+        issuer = current_iss
+        client_id = current_client_id
+
+        unless on_request_path?
+          # One-time-use, mirroring omniauth.state/omniauth.nonce: this
+          # login attempt is finishing (successfully or not) either way.
+          session.delete("omniauth.lti13.iss")
+          session.delete("omniauth.lti13.client_id")
+        end
+
+        platform = platform_registry.find(issuer: issuer, client_id: client_id)
+        raise OmniAuth::Lti13::UnregisteredPlatformError, issuer unless platform
 
         apply_platform!(platform)
       end
@@ -102,15 +115,16 @@ module OmniAuth
 
       # Overrides OmniAuth::Strategies::OpenIDConnect#request_phase to
       # validate the login-initiation request itself (required params
-      # present, client_id consistent) and stash the resolved issuer in the
-      # session for the callback leg to find, before delegating to the base
-      # class's actual redirect-building logic. These are request-phase-only
-      # concerns, so they belong here rather than in setup_phase (which runs
-      # for both phases and should only do the platform resolution both
-      # legs genuinely share).
+      # present, client_id consistent) and stash the resolved issuer and
+      # client_id in the session for the callback leg to find, before
+      # delegating to the base class's actual redirect-building logic.
+      # These are request-phase-only concerns, so they belong here rather
+      # than in setup_phase (which runs for both phases and should only do
+      # the platform resolution both legs genuinely share).
       def request_phase
         validate_login_initiation!(current_platform)
         session["omniauth.lti13.iss"] = current_platform.issuer
+        session["omniauth.lti13.client_id"] = current_platform.client_id
         super
       end
 
@@ -177,7 +191,15 @@ module OmniAuth
       def validate_claims!(decoded)
         skew = options.clock_skew.to_i
         now = Time.now.to_i
-        expected_nonce = params["nonce"].presence || stored_nonce
+        # Deliberately session-only, never params["nonce"]: the LTI 1.3
+        # Authentication Response carries only id_token and state (per the
+        # IMS Security Framework) -- a nonce request param is never
+        # legitimate here. Anyone holding a captured id_token can trivially
+        # read its nonce claim (JWTs aren't encrypted), so honoring an
+        # attacker-supplied params["nonce"] that merely echoes the token's
+        # own claim would make this check compare a value against itself,
+        # defeating nonce-based replay protection entirely.
+        expected_nonce = stored_nonce
 
         unless decoded.iss == options.issuer
           raise OmniAuth::Lti13::InvalidIdTokenError, "iss #{decoded.iss.inspect} does not match expected issuer"
@@ -204,17 +226,30 @@ module OmniAuth
         return if decoded.azp.blank?
         return if decoded.azp == client_options.identifier
 
-        raise OmniAuth::Lti13::InvalidAzpError.new(decoded.azp, client_options.identifier)
+        log :warn, "id_token azp #{decoded.azp.inspect} does not match expected client_id " \
+                    "#{client_options.identifier.inspect}"
+        raise OmniAuth::Lti13::InvalidAzpError
       end
 
       # `iss` is guaranteed present on the initial (request-phase) launch,
       # per the IMS OIDC third-party-initiated login spec. Platforms aren't
-      # guaranteed to resend it on the callback, so that leg prefers the
-      # issuer stashed in the session during the request phase.
+      # guaranteed to resend it on the callback, so that leg reads the
+      # issuer stashed in the session during the request phase instead --
+      # deliberately *not* falling back to request.params["iss"] on the
+      # callback leg: that would let a callback POST with no real prior
+      # request-phase run (a missing/wiped session) select a platform from
+      # an attacker-controlled iss. Failing closed here means a callback
+      # that can't find its stashed issuer is simply unregistered, full
+      # stop, rather than falling back to trusting the request itself.
       def current_iss
-        return request.params["iss"] if on_request_path?
+        on_request_path? ? request.params["iss"] : session["omniauth.lti13.iss"]
+      end
 
-        session["omniauth.lti13.iss"] || request.params["iss"]
+      # Same reasoning and same fail-closed shape as current_iss above --
+      # client_id disambiguates when a Platform's issuer is shared across
+      # more than one of this tool's registrations (see PlatformRegistry).
+      def current_client_id
+        on_request_path? ? request.params["client_id"] : session["omniauth.lti13.client_id"]
       end
 
       # Rejecting a malformed login-initiation request here, before ever
@@ -237,7 +272,9 @@ module OmniAuth
         return if incoming_client_id.blank?
         return if incoming_client_id == platform.client_id
 
-        raise OmniAuth::Lti13::ClientIdMismatchError.new(platform.client_id, incoming_client_id)
+        log :warn, "login initiation client_id #{incoming_client_id.inspect} does not match registered " \
+                    "client_id #{platform.client_id.inspect} for issuer #{platform.issuer.inspect}"
+        raise OmniAuth::Lti13::ClientIdMismatchError
       end
 
       def apply_platform!(platform)
@@ -261,7 +298,9 @@ module OmniAuth
         deployment_id = claims[OmniAuth::Lti13::Claims::DEPLOYMENT_ID]
         return if current_platform.deployment_id?(deployment_id)
 
-        raise OmniAuth::Lti13::DeploymentMismatchError.new(current_platform.issuer, deployment_id)
+        log :warn, "deployment_id #{deployment_id.inspect} is not registered for issuer " \
+                    "#{current_platform.issuer.inspect} (registered: #{current_platform.deployment_ids.inspect})"
+        raise OmniAuth::Lti13::DeploymentMismatchError
       end
 
       # `claims` is the id_token's raw_attributes: an

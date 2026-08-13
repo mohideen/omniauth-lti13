@@ -22,9 +22,15 @@ module OmniAuth
     # issuer), so this only fires when it's actually sent and wrong -- it's
     # never used to select the platform in the first place, only to catch a
     # mismatch against what issuer-based lookup already resolved.
+    #
+    # Deliberately generic: OmniAuth's `fail!(e.message, e)` puts this
+    # message on the failure redirect (Avalon surfaces it in a query param),
+    # so it must not embed our registered client_id or the caller's. Log
+    # the specifics at the raise site instead, where they're useful for an
+    # operator without being handed to whoever triggered the failure.
     class ClientIdMismatchError < Error
-      def initialize(expected, actual)
-        super("login initiation client_id #{actual.inspect} does not match registered client_id #{expected.inspect}")
+      def initialize
+        super("login initiation client_id does not match the registered platform")
       end
     end
 
@@ -47,9 +53,12 @@ module OmniAuth
     # client_id + deployment_id together identify a registered deployment,
     # rather than collapsing them into one opaque key the way LTI 1.1's
     # oauth_consumer_key did).
+    #
+    # Deliberately generic (see ClientIdMismatchError above for why): does
+    # not embed the issuer or the platform's registered deployment_ids.
     class DeploymentMismatchError < Error
-      def initialize(issuer, deployment_id)
-        super("deployment_id #{deployment_id.inspect} is not registered for issuer #{issuer.inspect}")
+      def initialize
+        super("deployment_id is not registered for this platform")
       end
     end
 
@@ -93,9 +102,26 @@ module OmniAuth
     # spec, azp only needs checking when present (it disambiguates the
     # audience when aud has multiple values); OmniAuth::Strategies::
     # OpenIDConnect doesn't check it at all.
+    #
+    # Deliberately generic (see ClientIdMismatchError above for why): does
+    # not embed either the token's azp or our registered client_id.
     class InvalidAzpError < Error
-      def initialize(azp, expected_client_id)
-        super("id_token azp #{azp.inspect} does not match expected client_id #{expected_client_id.inspect}")
+      def initialize
+        super("id_token azp does not match the expected client_id")
+      end
+    end
+
+    # Raised when an issuer maps to more than one registered Platform (e.g.
+    # Canvas Cloud's shared https://canvas.instructure.com issuer across
+    # tenants) and the request doesn't supply a client_id to disambiguate.
+    # client_id is optional on the login-initiation request in general, but
+    # effectively required whenever a Platform's issuer is shared across
+    # more than one of this tool's registrations -- guessing which one is
+    # meant would be wrong far more often than it'd be convenient.
+    class AmbiguousPlatformError < Error
+      def initialize(issuer)
+        super("issuer #{issuer.inspect} matches more than one registered platform; client_id is required to " \
+              "disambiguate")
       end
     end
   end

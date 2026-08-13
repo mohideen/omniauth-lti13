@@ -32,7 +32,8 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
 
   spec.add_dependency "omniauth_openid_connect", "~> 0.8"
-
-  # For more information and examples about making a new gem, check out our
-  # guide at: https://bundler.io/guides/creating_gem.html
+  # blank?/presence -- declared explicitly rather than relying on it coming
+  # in transitively via json-jwt/openid_connect, which is fragile for a
+  # standalone gem (an unrelated dependency bump could drop it).
+  spec.add_dependency "activesupport"
 end

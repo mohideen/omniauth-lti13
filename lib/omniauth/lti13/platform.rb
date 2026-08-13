@@ -24,7 +24,13 @@ module OmniAuth
       def initialize(issuer:, client_id:, deployment_ids:, authorization_endpoint:, jwks_uri:, redirect_uri:)
         @issuer = issuer
         @client_id = client_id
-        @deployment_ids = Array(deployment_ids)
+        # Coerced to strings: the LTI deployment_id claim is always a JSON
+        # string, but YAML config (settings.yml) parses an unquoted numeric
+        # deployment_id (e.g. `deployment_ids: [1]`) as an Integer, and
+        # `[1].include?("1")` is false -- comparing as anything other than
+        # strings would silently reject every launch from a deployment_id
+        # that happens to look numeric.
+        @deployment_ids = Array(deployment_ids).map(&:to_s)
         @authorization_endpoint = authorization_endpoint
         @jwks_uri = jwks_uri
         @redirect_uri = redirect_uri
@@ -33,7 +39,7 @@ module OmniAuth
       end
 
       def deployment_id?(deployment_id)
-        deployment_ids.include?(deployment_id)
+        deployment_ids.include?(deployment_id.to_s)
       end
 
       private
