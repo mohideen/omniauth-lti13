@@ -3,7 +3,7 @@
 require "omniauth/lti13"
 require "webmock/rspec"
 
-Dir[File.join(__dir__, "support", "**", "*.rb")].sort.each { |f| require f }
+Dir[File.join(__dir__, "support", "**", "*.rb")].each { |f| require f }
 
 WebMock.disable_net_connect!
 

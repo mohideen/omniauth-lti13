@@ -10,13 +10,14 @@ Gem::Specification.new do |spec|
 
   spec.summary = "OmniAuth strategy for LTI 1.3 (IMS Core launch/auth) built on omniauth_openid_connect."
   spec.description = "Implements the LTI 1.3 third-party-initiated OIDC login and launch flow as an " \
-                      "OmniAuth strategy, mapping LTI claims to an OmniAuth auth_hash. Built on top of " \
-                      "omniauth_openid_connect rather than reimplementing OIDC/JWT handling. LTI Advantage " \
-                      "(Deep Linking, AGS, NRPS) is out of scope."
+                     "OmniAuth strategy, mapping LTI claims to an OmniAuth auth_hash. Built on top of " \
+                     "omniauth_openid_connect rather than reimplementing OIDC/JWT handling. LTI Advantage " \
+                     "(Deep Linking, AGS, NRPS) is out of scope."
   spec.homepage = "https://github.com/avalonmediasystem/omniauth-lti13"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.2.0"
   spec.metadata["source_code_uri"] = "https://github.com/avalonmediasystem/omniauth-lti13"
+  spec.metadata["rubygems_mfa_required"] = "true"
 
   # Specify which files should be added to the gem when it is released.
   # The `git ls-files -z` loads the files in the RubyGem that have been added into git.

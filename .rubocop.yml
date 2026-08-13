@@ -1,0 +1,94 @@
+plugins:
+  - rubocop-rspec
+
+AllCops:
+  TargetRubyVersion: 3.2
+  NewCops: enable
+  SuggestExtensions: false
+  Exclude:
+    - "bin/**/*"
+    - "vendor/**/*"
+
+# --- House style -----------------------------------------------------------
+# Double quotes throughout, matching the bundler gem template this started
+# from and the rest of the OmniAuth ecosystem.
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
+
+Style/StringLiteralsInInterpolation:
+  EnforcedStyle: double_quotes
+
+Style/TrailingCommaInHashLiteral:
+  EnforcedStyleForMultiline: consistent_comma
+
+Style/TrailingCommaInArrayLiteral:
+  EnforcedStyleForMultiline: consistent_comma
+
+Layout/LineLength:
+  Max: 120
+
+# validate_claims! deliberately writes five consecutive checks in one shape
+# (`unless <cond> ... raise ... end`); letting the short ones collapse to
+# modifier form would make a uniform sequence read as four different things.
+Style/IfUnlessModifier:
+  Enabled: false
+
+# --- Metrics ---------------------------------------------------------------
+# Specs are long by nature here: descriptive example names and multi-step
+# launch scenarios (request phase + callback + assertions) in one block.
+Metrics/BlockLength:
+  Exclude:
+    - "spec/**/*"
+    - "*.gemspec"
+
+Metrics/ModuleLength:
+  Exclude:
+    - "spec/**/*"
+
+Metrics/MethodLength:
+  Max: 25
+  Exclude:
+    - "spec/**/*"
+
+Metrics/AbcSize:
+  Max: 25
+  Exclude:
+    - "spec/**/*"
+
+# The launch-flow helpers take many keyword args by design (jwt_alg, jwt_kid,
+# state_override, ... ), each one a knob a specific failure-path spec turns.
+Metrics/ParameterLists:
+  CountKeywordArgs: false
+
+Metrics/ClassLength:
+  Max: 150
+
+# PlatformRegistry#find is a deliberate decision cascade (blank issuer ->
+# no match -> single match -> ambiguous -> disambiguate by client_id), and
+# each branch is a distinct, documented outcome. Splitting it would scatter
+# one lookup contract across several methods.
+Metrics/CyclomaticComplexity:
+  Max: 8
+
+# --- RSpec -----------------------------------------------------------------
+# Example descriptions here carry the *why* (spec-compliance rationale,
+# attack being guarded against), which routinely runs past the default.
+RSpec/ExampleLength:
+  Max: 25
+
+RSpec/MultipleExpectations:
+  Max: 8
+
+RSpec/DescribeClass:
+  Enabled: false
+
+# Long, sentence-style example names are the point -- they document the
+# behavior contract, and several are deliberately multi-line.
+RSpec/ExampleWording:
+  Enabled: false
+
+# Derives the expected spec path from the constant (OmniAuth -> omni_auth/),
+# but this gem's tree follows the require path and OmniAuth ecosystem
+# convention: lib/omniauth/..., so spec/omniauth/... mirrors it correctly.
+RSpec/SpecFilePathFormat:
+  Enabled: false

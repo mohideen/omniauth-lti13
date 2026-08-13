@@ -91,6 +91,21 @@ RSpec.describe OmniAuth::Lti13::PlatformRegistry do
         expect(platform).to be_nil
       end
 
+      # The caller turns that nil into UnregisteredPlatformError, whose
+      # message blames the issuer -- misleading here, since the issuer IS
+      # registered and only the client_id is unrecognized. The raised
+      # message stays generic (it reaches the end user), so this log line
+      # is the only thing distinguishing the two cases for an operator.
+      it "logs a distinct warning naming client_id, so an operator can tell 'unknown issuer' from " \
+         "'known issuer, unknown client_id'" do
+        allow(OmniAuth.logger).to receive(:warn)
+        registry = described_class.new([canvas_tenant_a_attrs, canvas_tenant_b_attrs])
+
+        registry.find(issuer: "https://canvas.example.edu", client_id: "some-other-client-id")
+
+        expect(OmniAuth.logger).to have_received(:warn).with(/client_id/)
+      end
+
       it "raises AmbiguousPlatformError when client_id is omitted, rather than guessing" do
         registry = described_class.new([canvas_tenant_a_attrs, canvas_tenant_b_attrs])
 

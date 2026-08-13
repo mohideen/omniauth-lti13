@@ -43,8 +43,27 @@ RSpec.describe OmniAuth::Lti13::Platform do
 
   describe "#initialize" do
     it "raises ArgumentError listing every missing required attribute" do
-      expect { described_class.new(**attrs.merge(issuer: "", client_id: "")) }
+      expect { described_class.new(**attrs, issuer: "", client_id: "") }
         .to raise_error(ArgumentError, /issuer.*client_id|client_id.*issuer/)
+    end
+
+    # A YAML typo (`deployment_ids: [~]`, or a dangling `-`) yields [nil].
+    # Coercing that to [""] would make it match a token carrying no
+    # deployment_id claim at all, silently disabling the deployment check --
+    # so blank entries are dropped, and an entry that was *only* blanks is
+    # then caught as a missing required attribute.
+    it "rejects a deployment_ids list containing only blank entries, rather than silently " \
+       "accepting a deployment_id-less token" do
+      expect { described_class.new(**attrs, deployment_ids: [nil]) }
+        .to raise_error(ArgumentError, /deployment_ids/)
+      expect { described_class.new(**attrs, deployment_ids: [""]) }
+        .to raise_error(ArgumentError, /deployment_ids/)
+    end
+
+    it "drops blank entries but keeps the real ones" do
+      platform = described_class.new(**attrs, deployment_ids: [1, nil, "2", ""])
+
+      expect(platform.deployment_ids).to eq(%w[1 2])
     end
   end
 
@@ -64,7 +83,7 @@ RSpec.describe OmniAuth::Lti13::Platform do
     it "matches regardless of whether the configured id is a String or an Integer -- unquoted YAML " \
        "config (e.g. `deployment_ids: [1]`) parses a numeric-looking id as an Integer, but the LTI " \
        "deployment_id claim is always a String" do
-      platform = described_class.new(**attrs.merge(deployment_ids: [1, "2"]))
+      platform = described_class.new(**attrs, deployment_ids: [1, "2"])
 
       expect(platform.deployment_id?("1")).to be true
       expect(platform.deployment_id?(2)).to be true

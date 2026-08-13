@@ -19,8 +19,10 @@ module OmniAuth
         duplicates = @platforms.group_by { |p| [p.issuer, p.client_id] }.select { |_key, group| group.size > 1 }
         return if duplicates.empty?
 
-        described = duplicates.keys.map { |issuer, client_id| "issuer=#{issuer.inspect} client_id=#{client_id.inspect}" }
-        raise ArgumentError, "Duplicate platform registration(s): #{described.join(', ')}"
+        described = duplicates.keys.map do |issuer, client_id|
+          "issuer=#{issuer.inspect} client_id=#{client_id.inspect}"
+        end
+        raise ArgumentError, "Duplicate platform registration(s): #{described.join(", ")}"
       end
 
       # `client_id` disambiguates when more than one Platform shares an
@@ -39,7 +41,26 @@ module OmniAuth
 
         raise OmniAuth::Lti13::AmbiguousPlatformError, issuer if client_id.blank?
 
-        matches.find { |platform| platform.client_id == client_id }
+        matches.find { |platform| platform.client_id == client_id } ||
+          log_unknown_client_id(issuer, client_id)
+      end
+
+      private
+
+      # Returning nil here makes the caller raise UnregisteredPlatformError,
+      # whose message says the *issuer* isn't registered -- true of the
+      # (issuer, client_id) pair, but misleading on its own, since this
+      # issuer is registered and only the client_id is unrecognized. The
+      # raised message stays generic (it reaches the end user via OmniAuth's
+      # failure redirect); this log line is what lets an operator tell the
+      # two cases apart.
+      def log_unknown_client_id(issuer, client_id)
+        OmniAuth.logger.warn(
+          "(lti) issuer #{issuer.inspect} is registered, but no registration matches client_id " \
+          "#{client_id.inspect} -- check the client_id in the Platform's tool configuration " \
+          "against this tool's :platforms config"
+        )
+        nil
       end
     end
   end

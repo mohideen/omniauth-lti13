@@ -12,6 +12,10 @@ require_relative "lti13/platform_registry"
 require_relative "strategies/lti13"
 
 module OmniAuth
+  # Namespace for this gem's supporting types. The strategy itself lives at
+  # OmniAuth::Strategies::Lti13, where OmniAuth expects to find strategies;
+  # everything it leans on (Platform, PlatformRegistry, Claims, the error
+  # hierarchy) is namespaced here.
   module Lti13
   end
 end

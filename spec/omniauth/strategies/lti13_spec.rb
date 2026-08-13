@@ -4,10 +4,9 @@ require "cgi"
 require "uri"
 
 RSpec.describe OmniAuth::Strategies::Lti13 do
-  let(:app) { ->(_env) { [404, {}, ["Not Found"]] } }
-
   subject(:strategy) { described_class.new(app) }
 
+  let(:app) { ->(_env) { [404, {}, ["Not Found"]] } }
   let(:canvas_platform) do
     {
       issuer: "https://canvas.example.edu",
@@ -18,7 +17,6 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
       redirect_uri: "https://tool.example.org/users/auth/lti/callback",
     }
   end
-
   let(:blackboard_platform) do
     {
       issuer: "https://blackboard.example.edu",
@@ -29,7 +27,6 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
       redirect_uri: "https://tool.example.org/users/auth/lti/callback",
     }
   end
-
   let(:valid_initiation_params) do
     {
       login_hint: "canvas-user-42",
@@ -37,7 +34,6 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
       lti_message_hint: "opaque-platform-generated-hint",
     }
   end
-
   let(:base_deployment_claim) do
     { "https://purl.imsglobal.org/spec/lti/claim/deployment_id" => canvas_platform[:deployment_ids].first }
   end
@@ -275,8 +271,8 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
   # session Hash (so replay-style tests can drive a second callback against
   # the same, now-partially-consumed, session).
   def perform_full_launch(platforms:, issuer:, client_id:, extra_claims: {},
-                           jwt_alg: :RS256, jwt_key: rsa_key, jwt_kid: nil, use_real_jwks_uri: false,
-                           state_override: nil, nonce_override: nil, initiation_client_id: nil)
+                          jwt_alg: :RS256, jwt_key: rsa_key, jwt_kid: nil, use_real_jwks_uri: false,
+                          state_override: nil, nonce_override: nil, initiation_client_id: nil)
     _rack_app, session = perform_request_phase(
       platforms: platforms, issuer: issuer, client_id: initiation_client_id, use_real_jwks_uri: use_real_jwks_uri
     )

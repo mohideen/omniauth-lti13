@@ -13,12 +13,23 @@ Avalon's `User.find_for_lti` expects, but any Rails app using Devise/OmniAuth ca
 **Out of scope:** LTI Advantage (Deep Linking, Assignment and Grade Services, Names and Role
 Provisioning Service). This gem implements Core launch/auth only.
 
+📖 **[Authentication flow walkthrough](docs/authentication-flow.md)** — sequence diagram and a
+method-by-method trace of both legs of a launch.
+
+## Requirements
+
+- Ruby >= 3.2
+- [`omniauth_openid_connect`](https://github.com/omniauth/omniauth_openid_connect) ~> 0.8 (the
+  OIDC/JWT machinery this builds on)
+- `activesupport`
+
 ## Installation
 
-Not yet published to RubyGems. Add it from git:
+Not yet published to RubyGems, and not yet tagged. Add it from git:
 
 ```ruby
-gem "omniauth-lti13", git: "https://github.com/avalonmediasystem/omniauth-lti13.git", tag: "v0.1.0"
+# pin to a specific commit until a release is tagged
+gem "omniauth-lti13", git: "https://github.com/avalonmediasystem/omniauth-lti13.git"
 ```
 
 or, for local development against a sibling checkout:
@@ -132,11 +143,11 @@ auth_hash.extra.roles                  # roles claim, passed through unmodified
 instances upgrading from 1.1 don't see existing course titles change. `context_title` is
 additive, exposing the full title separately for callers that want it.
 
-### Two things this gem cannot do for you
+### What the host app must handle
 
-These aren't gaps in this gem -- they're constraints of the OmniAuth middleware stack that
-apply process-wide, not per-strategy, so they have to be handled in the host app's own
-initializer, not here:
+These aren't gaps in this gem -- they're constraints of the surrounding stack (OmniAuth
+middleware config is process-wide, not per-strategy; cookie policy is the app's), so they have
+to be handled in the host app, not here:
 
 - **CSRF exemption for the login-initiation route.** OmniAuth 2.x's
   `OmniAuth::AuthenticityTokenProtection` rejects cross-site request-phase POSTs by default --
@@ -147,6 +158,19 @@ initializer, not here:
   login-initiation endpoint to accept both GET and POST; OmniAuth 2.x defaults
   `OmniAuth.config.allowed_request_methods` to `[:post]` only (also global). Widen it to
   `[:get, :post]` if a Platform you support initiates via GET.
+- **A session cookie that survives the cross-site callback POST** (`SameSite=None; Secure`).
+  The launch spans two requests, and everything the callback needs to be trustworthy --
+  `state`, `nonce`, and the resolved platform reference -- lives in the session between them.
+  The Platform POSTs the callback from *its* origin, so a `SameSite=Lax` session cookie is not
+  sent, the callback sees an empty session, and the launch fails. It fails **closed**, by
+  design (see "Design notes" below), but the resulting error names the symptom rather than the
+  cause:
+
+  ```text
+  /auth/failure?message=no+registered+LTI+platform+for+issuer+nil&strategy=lti
+  ```
+
+  If you see `issuer nil` in that message, suspect the cookie before suspecting the config.
 
 ## Security
 
@@ -167,10 +191,88 @@ initializer, not here:
   echo it back as a param to replay that token into a session of their own.
 - **`response_mode=form_post`**, per the IMS Security Framework.
 
+## Errors and troubleshooting
+
+Every failure raises a subclass of `OmniAuth::Lti13::Error`, which OmniAuth turns into its
+standard failure redirect (`/auth/failure?message=...`).
+
+**Three of these carry deliberately generic messages**, because OmniAuth's
+`fail!(e.message, e)` puts the message on that redirect, where the end user (and anything
+logging URLs) can see it. Leaking our registered `client_id`, `issuer`, or `deployment_ids`
+there would hand an attacker exactly the values needed to craft a better-formed forgery. The
+specifics go to `OmniAuth.logger` at `warn` instead -- **when diagnosing a rejected launch,
+read the log, not the redirect.**
+
+| Error | Raised when | Message detail |
+|---|---|---|
+| `UnregisteredPlatformError` | `iss` matches no registered platform (or, on the callback leg, no platform reference survived in the session) | names the issuer |
+| `AmbiguousPlatformError` | `iss` matches several registrations and no `client_id` was supplied to disambiguate | names the issuer |
+| `InvalidLoginInitiationError` | login initiation is missing `login_hint` and/or `target_link_uri` | names the missing params |
+| `ClientIdMismatchError` | login initiation's `client_id` is present but doesn't match the resolved platform | **generic** -- details logged |
+| `DeploymentMismatchError` | the token's `deployment_id` isn't registered for the resolved platform, or is absent | **generic** -- details logged |
+| `InvalidAzpError` | the token's `azp` is present but isn't our `client_id` | **generic** -- details logged |
+| `DisallowedAlgorithmError` | the token is signed with anything other than `RS256` (including `none`) | names the algorithm |
+| `ExpiredTokenError` | the token is past `exp` even allowing for `clock_skew` | names the expiry |
+| `InvalidIdTokenError` | `iss`, `aud`, `nonce`, or `iat` failed validation | names the failing claim |
+
+A known-issuer-but-unknown-`client_id` lookup surfaces as `UnregisteredPlatformError` (its
+message blames the issuer), so that case additionally logs a warning naming `client_id` --
+again, the log is what distinguishes the two.
+
+## Design notes: why we override the base class
+
+This gem subclasses `OmniAuth::Strategies::OpenIDConnect` and overrides four of its methods.
+Each override exists because the base behavior is wrong *for LTI specifically*, not because it
+is buggy in general -- collected here so the strategy source can stay focused on flow.
+
+**`verify_id_token!` -- reimplemented rather than calling `super`.** The base delegates to
+`OpenIDConnect::ResponseObject::IdToken#verify!`, which checks `exp` with no clock-skew
+tolerance and raises immediately, inside a single expression with no seam to intercept. There
+is no way to layer skew tolerance *on top of* an already-stricter check, so the check has to be
+replaced rather than wrapped. Since `iss`/`aud`/`nonce` then need reimplementing anyway, all
+id_token claim validation lives in one auditable place -- and `azp`, which the base never
+checks at all, is validated alongside them.
+
+**`decode_id_token` -- one retry with a forced JWKS re-fetch.** The base's own
+`JSON::JWK::Set::KidNotFound` handling only retries *locally*, trying each already-fetched key,
+and only for tokens with no `kid`; when a `kid` is present but unmatched it re-raises
+immediately. It never re-fetches. A Platform that rotates its signing key would therefore fail
+every launch until whatever populated the in-memory JWKS happened to restart. The override
+clears the base's memoized `@public_key`/`@fetch_key` and retries exactly once.
+
+**`validate_client_algorithm!` -- unconditional allowlist.** The base's algorithm check is
+opt-in: it only runs when `client_signing_alg` is explicitly configured, and then compares
+against that single value. LTI mandates `RS256`, and `alg: none` must never be accepted, so
+this runs unconditionally against an explicit allowlist instead.
+
+**`id_token_callback_phase` -- full LTI `auth_hash`.** The base builds a bare-bones AuthHash
+(uid/name/email only), bypassing its own `info`/`extra`/`uid` DSL and calling `call_app!`
+inline, which leaves no seam to extend. The override builds the full `auth_hash` contract
+documented above, and validates `deployment_id` before doing so.
+
+**Platform resolution fails closed on the callback leg.** `iss`/`client_id` are read from the
+request only during login initiation; the callback leg reads the values stashed in the session
+by that first leg, and does *not* fall back to request params. A callback arriving without a
+prior request phase (missing or wiped session) is therefore rejected outright rather than being
+allowed to select a platform from an attacker-controlled `iss`. This is what makes a dropped
+session cookie surface as `issuer nil` (see "What the host app must handle" above).
+
+**The id_token is decoded twice per callback.** `verify_id_token!` decodes to validate claims,
+then `id_token_callback_phase` decodes again to build the `auth_hash`. This is deliberate: the
+JWKS fetch is memoized, so the second decode costs one signature verification and no I/O, and
+keeping each method self-contained (rather than threading a decoded token between them) matches
+the base class's own structure.
+
 ## Development
 
-After checking out the repo, run `bundle install`. Then, run `bundle exec rspec` to run the
-tests. You can also run `bin/console` for an interactive prompt.
+After checking out the repo, run `bundle install`. Then:
+
+```bash
+bundle exec rake        # specs + rubocop (the default task)
+bundle exec rspec       # specs only
+bundle exec rubocop -a  # lint, autocorrecting what's safe
+bin/console             # interactive prompt with the gem loaded
+```
 
 To install this gem onto your local machine, run `bundle exec rake install`.
 

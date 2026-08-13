@@ -42,7 +42,7 @@ module OmniAuth
     # will only fail later, harder to diagnose, on the Platform's end.
     class InvalidLoginInitiationError < Error
       def initialize(missing_params)
-        super("login initiation request missing required param(s): #{missing_params.join(', ')}")
+        super("login initiation request missing required param(s): #{missing_params.join(", ")}")
       end
     end
 
@@ -71,7 +71,7 @@ module OmniAuth
     # allowlist.
     class DisallowedAlgorithmError < Error
       def initialize(algorithm, allowed)
-        super("id_token signed with disallowed algorithm #{algorithm.inspect} (allowed: #{allowed.join(', ')})")
+        super("id_token signed with disallowed algorithm #{algorithm.inspect} (allowed: #{allowed.join(", ")})")
       end
     end
 
