@@ -221,9 +221,21 @@ again, the log is what distinguishes the two.
 
 ## Design notes: why we override the base class
 
-This gem subclasses `OmniAuth::Strategies::OpenIDConnect` and overrides four of its methods.
-Each override exists because the base behavior is wrong *for LTI specifically*, not because it
-is buggy in general -- collected here so the strategy source can stay focused on flow.
+This gem subclasses `OmniAuth::Strategies::OpenIDConnect` and overrides six of its parents'
+methods -- five from the OIDC strategy, plus `setup_phase` from `OmniAuth::Strategy`. They fall
+into two groups.
+
+**Two are extension points**, where the base class is fine and this strategy simply has
+LTI-specific work to do at that point in the lifecycle. `request_phase` validates the
+login-initiation request and stashes the resolved platform reference in the session, then calls
+`super` for the actual redirect building. `setup_phase` resolves this request's Platform and
+applies it to `client_options`/`issuer`; it does *not* call `super`, which has one consequence
+worth knowing about -- see "The `:setup` option" at the end of this section.
+
+**The other four replace base behavior that is wrong _for LTI specifically_** -- not buggy in
+general. Those are the ones detailed below, collected here so the strategy source can stay
+focused on flow. (Grouping is by *why* each override exists, not by whether it calls `super`:
+`decode_id_token` wraps `super` with a retry but still belongs to this group.)
 
 **`verify_id_token!` -- reimplemented rather than calling `super`.** The base delegates to
 `OpenIDConnect::ResponseObject::IdToken#verify!`, which checks `exp` with no clock-skew
@@ -262,6 +274,29 @@ then `id_token_callback_phase` decodes again to build the `auth_hash`. This is d
 JWKS fetch is memoized, so the second decode costs one signature verification and no I/O, and
 keeping each method self-contained (rather than threading a decoded token between them) matches
 the base class's own structure.
+
+### The `:setup` option is not supported
+
+`OmniAuth::Strategy#setup_phase` is not a no-op: it implements OmniAuth's `:setup` option,
+calling `options[:setup].call(env)` for a callable or dispatching to `setup_path` otherwise.
+This strategy's `setup_phase` **does not call `super`**, so passing `setup:` has no effect and
+raises no error.
+
+That is deliberate, because there is no ordering in which `:setup` composes safely with
+per-request platform resolution:
+
+- Calling `super` **first** would run the host's hook, and then `apply_platform!` would
+  immediately overwrite `options.issuer` and every `client_options` field it sets. A host using
+  `:setup` for its conventional purpose -- dynamic per-request client configuration -- would
+  have that silently clobbered, which is worse than an unsupported option, because it looks like
+  it should work.
+- Calling `super` **last** would let the host's hook override the resolution that just ran. But
+  that resolution *is* the trust boundary: `issuer`, `client_id`, and `jwks_uri` determine which
+  Platform we accept tokens from. Handing a host hook the ability to rewrite them after
+  validation would undo the point of the registry.
+
+Configure platforms through the `:platforms` option instead, which is resolved per-request by
+design. `option :setup` defaults to `false`, so an app that doesn't set it is unaffected.
 
 ## Development
 

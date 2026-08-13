@@ -16,10 +16,12 @@ module OmniAuth
     #
     # Methods are ordered by launch flow (shared setup -> request leg ->
     # callback leg -> auth_hash), not by visibility. Methods the framework
-    # calls into are tagged "Framework hook"; the rest are ours. Four of
-    # those hooks override base-class behavior; *why* is documented once,
-    # under "Design notes: why we override the base class" in the README,
-    # so each override here carries only a one-line pointer.
+    # calls into are tagged "Framework hook"; the rest are ours. All six
+    # tagged methods override a parent: two (setup_phase, request_phase)
+    # are extension points where this strategy adds its own work, and four
+    # replace base behavior that is wrong for LTI. The reasoning for every
+    # one of them lives under "Design notes: why we override the base
+    # class" in the README, so each carries only a one-line pointer here.
     class Lti13 < OmniAuth::Strategies::OpenIDConnect
       option :name, "lti"
 
@@ -81,6 +83,10 @@ module OmniAuth
       # An unregistered or ambiguous issuer raises rather than falling back
       # to a default; the raise propagates through OmniAuth::Strategy#call!'s
       # rescue, becoming a standard OmniAuth failure response.
+      #
+      # Replaces the base implementation without calling super, so OmniAuth's
+      # `:setup` option is deliberately unsupported here -- see "Design notes"
+      # (the :setup option) for why it can't compose with this resolution.
       def setup_phase
         issuer = current_iss
         client_id = current_client_id
