@@ -178,6 +178,18 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
       expect(redirect_params["scope"]).to eq("openid")
     end
 
+    it "includes prompt=none in the authorization request (Canvas requires it; omitting it " \
+       "causes Canvas to respond with error=invalid_request_object before the form_post callback)" do
+      response = post_to_request_phase(
+        platforms: [canvas_platform],
+        params: valid_initiation_params.merge(iss: canvas_platform[:issuer])
+      )
+
+      redirect_params = redirect_query_params(response)
+
+      expect(redirect_params["prompt"]).to eq("none")
+    end
+
     it "threads login_hint, lti_message_hint, and target_link_uri through to the authorization request " \
        "unmodified, without dropping lti_message_hint" do
       response = post_to_request_phase(
@@ -487,6 +499,58 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
       )
 
       expect_launch_rejected(second_response, second_env)
+    end
+  end
+
+  describe "error callbacks from the Platform (e.g. missing prompt)" do
+    # When the Platform rejects the authorization request before issuing an
+    # id_token (Canvas does this for missing prompt=none), it redirects back
+    # to the callback URL with error= instead of posting an id_token. The
+    # strategy must not raise UnregisteredPlatformError in setup_phase in
+    # this case -- the session key omniauth.lti13.iss may not be present
+    # (error redirect vs. form_post uses a different browser round-trip), so
+    # setup_phase skips platform resolution and lets callback_phase surface
+    # the error from the Platform instead.
+    def perform_error_callback(platforms:, error:, error_description: nil, session: {})
+      downstream_env = nil
+      rack_app = build_rack_app(platforms: platforms) do |env|
+        downstream_env = env
+        [200, {}, ["ok"]]
+      end
+
+      query_params = { error: error }
+      query_params[:error_description] = error_description if error_description
+      callback_env = Rack::MockRequest.env_for(
+        "/auth/lti/callback?#{to_query(query_params)}", method: "GET", "rack.session" => session
+      )
+      response = Rack::MockResponse.new(*rack_app.call(callback_env))
+
+      [response, downstream_env]
+    end
+
+    it "redirects to /auth/failure with the Platform's error, rather than raising " \
+       "UnregisteredPlatformError because omniauth.lti13.iss is absent from the session" do
+      response, _env = perform_error_callback(
+        platforms: [canvas_platform],
+        error: "invalid_request_object",
+        error_description: "The following parameters are missing: prompt"
+      )
+
+      expect(response.status).to eq(302)
+      expect(response.location).to start_with("/auth/failure")
+      expect(response.location).to include("invalid_request_object")
+    end
+
+    it "also handles an error callback that arrives with a stale session " \
+       "(session cookie not sent back by the browser)" do
+      response, _env = perform_error_callback(
+        platforms: [canvas_platform],
+        error: "access_denied",
+        session: {}
+      )
+
+      expect(response.status).to eq(302)
+      expect(response.location).to start_with("/auth/failure")
     end
   end
 

@@ -49,6 +49,12 @@ module OmniAuth
       # platform lookup resolved.
       option :allow_authorize_params, %i[login_hint lti_message_hint target_link_uri]
 
+      # Canvas (and LTI 1.3 in general) requires prompt=none in the
+      # authorization request. The base class includes it when set; nil
+      # means the param is omitted, which causes Canvas to reject the
+      # request with error=invalid_request_object.
+      option :prompt, "none"
+
       # Tolerance (seconds) for ordinary clock drift against the Platform
       # when checking exp/iat. Configurable; the allowlist below is not,
       # since the IMS Security Framework mandates RS256 specifically.
@@ -88,6 +94,14 @@ module OmniAuth
       # `:setup` option is deliberately unsupported here -- see "Design notes"
       # (the :setup option) for why it can't compose with this resolution.
       def setup_phase
+        # If the Platform already reported an error (e.g. missing prompt),
+        # skip platform resolution -- callback_phase will surface the
+        # error param without needing a valid platform. Attempting lookup
+        # here would raise UnregisteredPlatformError (issuer nil, since the
+        # session key omniauth.lti13.iss may not survive an error redirect)
+        # and mask the real error before the base class can handle it.
+        return if !on_request_path? && request.params["error"].present?
+
         issuer = current_iss
         client_id = current_client_id
         consume_stashed_platform_ref! unless on_request_path?
