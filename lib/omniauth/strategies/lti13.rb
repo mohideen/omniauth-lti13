@@ -321,7 +321,7 @@ module OmniAuth
         AuthHash.new(
           provider: name,
           uid: claims["sub"],
-          info: { email: claims["email"] },
+          info: build_info(claims),
           extra: {
             # label wins over title, preserving LTI 1.1 semantics where
             # Course.title held the label, not a full title; title is only a
@@ -334,6 +334,33 @@ module OmniAuth
             roles: claims[OmniAuth::Lti13::Claims::ROLES],
           }
         )
+      end
+
+      # `info` is the standard `email` claim plus every custom-claim
+      # parameter, each under a `custom_` prefix. `info.email` is always set,
+      # to an explicit nil when the Platform sends no email -- consumers rely
+      # on the key existing.
+      def build_info(claims)
+        custom_params(claims).merge("email" => claims["email"])
+      end
+
+      # The custom claim is a flat JSON object of parameters configured in the
+      # tool registration on the Platform, arriving inside the signed token.
+      #
+      # Keys are prefixed with `custom_` and stringified, which namespaces
+      # them away from the standard fields entirely: a Platform parameter
+      # named `email` lands on `info.custom_email` and cannot shadow the
+      # standard `email` claim, and one named `name` or `nickname` no longer
+      # fills the OmniAuth field of that name. Copied rather than referenced,
+      # since merging into it in place would mutate the decoded token. A
+      # Platform that sends something other than an object for this claim is
+      # ignored rather than allowed to raise -- custom params are optional,
+      # and a malformed one shouldn't sink an otherwise valid launch.
+      def custom_params(claims)
+        custom = claims[OmniAuth::Lti13::Claims::CUSTOM]
+        return {} unless custom.is_a?(Hash)
+
+        custom.to_h.transform_keys { |key| "custom_#{key}" }
       end
     end
   end

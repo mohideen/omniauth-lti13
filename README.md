@@ -128,6 +128,8 @@ On a successful launch, `env["omniauth.auth"]` is populated with:
 ```ruby
 auth_hash.uid                          # LTI `sub`
 auth_hash.info.email                   # LTI `email` (nil if the Platform didn't send one)
+auth_hash.info.custom_<param>          # each parameter from the custom claim, under a
+                                        # `custom_` prefix -- see "Custom parameters" below
 auth_hash.extra.context_id             # context claim's `id`
 auth_hash.extra.context_name           # context claim's `label`, falling back to `title`
                                         # if label is absent; explicit nil if neither is
@@ -142,6 +144,33 @@ auth_hash.extra.roles                  # roles claim, passed through unmodified
 `omniauth-lti` fork's behavior (`context_label` mapped to what became `Course.title`), so
 instances upgrading from 1.1 don't see existing course titles change. `context_title` is
 additive, exposing the full title separately for callers that want it.
+
+#### Custom parameters
+
+The LTI custom claim (`https://purl.imsglobal.org/spec/lti/claim/custom`) carries whatever
+parameters were configured in the tool registration on the Platform — a campus username, an
+internal user id, a department code. They arrive inside the signed `id_token`, so they are as
+trustworthy as any other claim, and each is merged into `info` under a **`custom_` prefix**:
+
+```ruby
+# custom claim: { "canvas_user_id" => "1234", "department" => "Music Library" }
+auth_hash.info.custom_canvas_user_id  # => "1234"
+auth_hash.info.custom_department      # => "Music Library"
+```
+
+The prefix keeps the Platform's namespace and this gem's separate, which has two consequences:
+
+- **A custom parameter can never shadow a standard `info` field.** One named `email`, `name`, or
+  `nickname` lands on `custom_email` / `custom_name` / `custom_nickname`; the standard fields are
+  only ever set from their own claims.
+- **`info.email` comes from the standard `email` claim alone**, and is an explicit `nil` when the
+  Platform doesn't send one. If your Platform releases email *only* as a custom parameter — some
+  do — it will be at `info.custom_email`, and `info.email` will be nil. Read it from there, or
+  configure the Platform to release the standard claim.
+
+A Platform that sends something other than a JSON object for this claim is ignored rather than
+allowed to raise: custom parameters are optional, and a malformed one shouldn't sink an
+otherwise valid launch.
 
 ### What the host app must handle
 

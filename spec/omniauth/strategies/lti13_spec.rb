@@ -597,6 +597,98 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
     end
   end
 
+  describe "custom claim parameters in auth_hash.info" do
+    let(:custom_claim) { "https://purl.imsglobal.org/spec/lti/claim/custom" }
+
+    def build_info(claims)
+      strategy.send(:build_auth_hash, claims).info
+    end
+
+    it "exposes each configured custom parameter as a custom_-prefixed info field" do
+      info = build_info(
+        "sub" => "user-42",
+        "email" => "student@example.edu",
+        custom_claim => { "canvas_user_id" => "1234", "eppn" => "student@example.edu" }
+      )
+
+      expect(info.custom_canvas_user_id).to eq("1234")
+      expect(info.custom_eppn).to eq("student@example.edu")
+      expect(info.email).to eq("student@example.edu")
+    end
+
+    it "does not expose custom parameters under their unprefixed names" do
+      info = build_info("sub" => "user-42", custom_claim => { "canvas_user_id" => "1234" })
+
+      expect(info.key?("canvas_user_id")).to be false
+    end
+
+    it "still sets info.email to an explicit nil when there is no custom claim at all" do
+      info = build_info("sub" => "user-42")
+
+      expect(info.key?("email")).to be true
+      expect(info.email).to be_nil
+    end
+
+    # The prefix makes shadowing impossible by construction: a custom `email`
+    # can only ever land on `custom_email`, so the standard claim owns
+    # `info.email` outright and no precedence rule is needed.
+    it "cannot shadow the standard email claim with a custom parameter of the same name" do
+      info = build_info(
+        "sub" => "user-42",
+        "email" => "standard@example.edu",
+        custom_claim => { "email" => "custom@example.edu" }
+      )
+
+      expect(info.email).to eq("standard@example.edu")
+      expect(info.custom_email).to eq("custom@example.edu")
+    end
+
+    # Consequence worth pinning down: a Platform that only sends email as a
+    # custom param leaves info.email nil, and the value is reachable at
+    # info.custom_email instead.
+    it "leaves info.email nil when email arrives only as a custom parameter" do
+      info = build_info("sub" => "user-42", custom_claim => { "email" => "custom@example.edu" })
+
+      expect(info.email).to be_nil
+      expect(info.custom_email).to eq("custom@example.edu")
+    end
+
+    it "does not fill standard OmniAuth info fields from custom parameters" do
+      info = build_info("sub" => "user-42", custom_claim => { "name" => "Ada Lovelace" })
+
+      expect(info.name).to be_nil
+      expect(info.custom_name).to eq("Ada Lovelace")
+    end
+
+    it "does not mutate the decoded token while building info" do
+      claims = { "sub" => "user-42", custom_claim => { "canvas_user_id" => "1234" } }
+
+      build_info(claims)
+
+      expect(claims[custom_claim]).to eq({ "canvas_user_id" => "1234" })
+    end
+
+    it "ignores a custom claim that isn't an object, rather than sinking an otherwise valid launch" do
+      info = build_info("sub" => "user-42", "email" => "student@example.edu", custom_claim => "not-an-object")
+
+      expect(info.email).to eq("student@example.edu")
+    end
+
+    it "carries custom parameters through a full launch, not just a direct build_auth_hash call" do
+      _response, env = perform_full_launch(
+        platforms: [canvas_platform],
+        issuer: canvas_platform[:issuer],
+        client_id: canvas_platform[:client_id],
+        extra_claims: base_deployment_claim.merge(
+          custom_claim => { "canvas_user_id" => "1234", "department" => "Music Library" }
+        )
+      )
+
+      expect(env["omniauth.auth"].info.custom_canvas_user_id).to eq("1234")
+      expect(env["omniauth.auth"].info.custom_department).to eq("Music Library")
+    end
+  end
+
   describe "security hardening" do
     describe "JWT algorithm allowlist" do
       it "rejects alg: none (the classic unsigned-token forgery vector)" do

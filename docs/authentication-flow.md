@@ -135,6 +135,7 @@ deployment — and builds the `auth_hash`.
 flowchart LR
     sub["sub"] --> uid["auth_hash.uid"]
     email["email"] --> infoEmail["auth_hash.info.email"]
+    custom[".../custom<br/>(each parameter)"] --> infoCustom["info.custom_&lt;param name&gt;"]
     ctxId[".../context.id"] --> ctxIdOut["extra.context_id"]
     label[".../context.label"] --> name["extra.context_name"]
     title[".../context.title"] -.->|fallback when<br/>label absent| name
@@ -146,7 +147,13 @@ flowchart LR
 `context_name` prefers `label` and falls back to `title`, preserving LTI 1.1 semantics where
 `Course.title` held the short label; `context_title` exposes the full title additively. When the
 context claim carries neither, `context_name` is an explicit `nil` rather than an absent key, so
-the host app can distinguish "not present" from "key missing". See the README for the full
+the host app can distinguish "not present" from "key missing".
+
+Custom claim parameters — whatever was configured in the tool registration — are merged into
+`info` under a `custom_` prefix, which keeps the Platform's namespace separate from the standard
+fields: a custom parameter named `email` or `name` lands on `custom_email` / `custom_name` and
+can never shadow the field of that name. The one dashed edge above is the sole precedence rule
+left: `title` fills `context_name` only when `label` is absent. See the README for the full
 contract.
 
 ## Session keys
