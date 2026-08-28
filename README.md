@@ -218,7 +218,9 @@ to be handled in the host app, not here:
   Authentication Response never carries one (only `id_token` and `state` do) and JWTs aren't
   encrypted, so anyone holding a captured `id_token` could otherwise read its `nonce` claim and
   echo it back as a param to replay that token into a session of their own.
-- **`response_mode=form_post`**, per the IMS Security Framework.
+- **`response_mode=form_post`** and **`prompt=none`**, per the IMS Security Framework. Canvas
+  rejects an authorization request that omits `prompt=none` with
+  `error=invalid_request_object`, before any `id_token` is posted back.
 
 ## Errors and troubleshooting
 
@@ -297,6 +299,13 @@ by that first leg, and does *not* fall back to request params. A callback arrivi
 prior request phase (missing or wiped session) is therefore rejected outright rather than being
 allowed to select a platform from an attacker-controlled `iss`. This is what makes a dropped
 session cookie surface as `issuer nil` (see "What the host app must handle" above).
+
+There is one deliberate exception: a callback carrying an `error` param skips resolution
+entirely, so the base class's `callback_phase` can surface the Platform's own error. The session
+key may not survive an error redirect the way it survives the normal `form_post` round-trip, and
+attempting a lookup there would raise `UnregisteredPlatformError` (`issuer nil`) *over* the real
+error, masking the actual cause. Nothing is authenticated on that path -- it only chooses which
+failure the operator sees.
 
 **The id_token is decoded twice per callback.** `verify_id_token!` decodes to validate claims,
 then `id_token_callback_phase` decodes again to build the `auth_hash`. This is deliberate: the
