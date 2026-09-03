@@ -597,81 +597,80 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
     end
   end
 
-  describe "custom claim parameters in auth_hash.info" do
+  describe "custom claim parameters in auth_hash.extra.custom" do
     let(:custom_claim) { "https://purl.imsglobal.org/spec/lti/claim/custom" }
 
-    def build_info(claims)
-      strategy.send(:build_auth_hash, claims).info
+    def build_extra(claims)
+      strategy.send(:build_auth_hash, claims).extra
     end
 
-    it "exposes each configured custom parameter as a custom_-prefixed info field" do
-      info = build_info(
+    it "exposes each configured custom parameter under its own name, unprefixed" do
+      extra = build_extra(
         "sub" => "user-42",
-        "email" => "student@example.edu",
-        custom_claim => { "canvas_user_id" => "1234", "eppn" => "student@example.edu" }
+        custom_claim => { "course_term_name" => "Default Term", "canvas_user_id" => "1234" }
       )
 
-      expect(info.custom_canvas_user_id).to eq("1234")
-      expect(info.custom_eppn).to eq("student@example.edu")
-      expect(info.email).to eq("student@example.edu")
+      expect(extra.custom["course_term_name"]).to eq("Default Term")
+      expect(extra.custom["canvas_user_id"]).to eq("1234")
     end
 
-    it "does not expose custom parameters under their unprefixed names" do
-      info = build_info("sub" => "user-42", custom_claim => { "canvas_user_id" => "1234" })
+    # Regression guard for the production 500 this shape was chosen to make
+    # impossible: a launch with no custom claim must still leave `extra.custom`
+    # present, so dereferencing an unknown key returns nil instead of raising
+    # NoMethodError on a nil intermediate.
+    it "leaves extra.custom an empty hash, never nil, when the Platform sends no custom claim" do
+      extra = build_extra("sub" => "user-42")
 
-      expect(info.key?("canvas_user_id")).to be false
+      expect(extra.custom).to eq({})
+      expect { extra.custom.anything_at_all }.not_to raise_error
+      expect(extra.custom.anything_at_all).to be_nil
     end
 
-    it "still sets info.email to an explicit nil when there is no custom claim at all" do
-      info = build_info("sub" => "user-42")
+    it "leaves extra.custom an empty hash when the custom claim isn't an object, " \
+       "rather than sinking an otherwise valid launch" do
+      extra = build_extra("sub" => "user-42", custom_claim => "not-an-object")
 
-      expect(info.key?("email")).to be true
-      expect(info.email).to be_nil
+      expect(extra.custom).to eq({})
+      expect(extra.custom.anything_at_all).to be_nil
     end
 
-    # The prefix makes shadowing impossible by construction: a custom `email`
-    # can only ever land on `custom_email`, so the standard claim owns
-    # `info.email` outright and no precedence rule is needed.
-    it "cannot shadow the standard email claim with a custom parameter of the same name" do
-      info = build_info(
+    # Asserted via `info["name"]` rather than `info.name`: OmniAuth's InfoHash
+    # defines `name` as a computed method that falls back to first/last name,
+    # then nickname, then *email* -- so `info.name` is never nil here, no
+    # matter what we do. The raw key lookup is what shows the custom parameter
+    # never landed in info.
+    it "keeps custom parameters out of info entirely, so none can shadow a standard field" do
+      auth_hash = strategy.send(
+        :build_auth_hash,
         "sub" => "user-42",
         "email" => "standard@example.edu",
-        custom_claim => { "email" => "custom@example.edu" }
+        custom_claim => { "email" => "custom@example.edu", "name" => "Ada Lovelace" }
       )
 
-      expect(info.email).to eq("standard@example.edu")
-      expect(info.custom_email).to eq("custom@example.edu")
+      expect(auth_hash.info.email).to eq("standard@example.edu")
+      expect(auth_hash.info.key?("name")).to be false
+      expect(auth_hash.info["name"]).to be_nil
+      expect(auth_hash.extra.custom["email"]).to eq("custom@example.edu")
+      expect(auth_hash.extra.custom["name"]).to eq("Ada Lovelace")
     end
 
-    # Consequence worth pinning down: a Platform that only sends email as a
-    # custom param leaves info.email nil, and the value is reachable at
-    # info.custom_email instead.
-    it "leaves info.email nil when email arrives only as a custom parameter" do
-      info = build_info("sub" => "user-42", custom_claim => { "email" => "custom@example.edu" })
+    # A Platform releasing email only as a custom parameter leaves info.email
+    # nil; the value is reachable at extra.custom["email"] for a host app that
+    # wants to fall back to it.
+    it "does not populate info.email from a custom email parameter" do
+      auth_hash = strategy.send(:build_auth_hash, "sub" => "user-42", custom_claim => { "email" => "custom@x.edu" })
 
-      expect(info.email).to be_nil
-      expect(info.custom_email).to eq("custom@example.edu")
+      expect(auth_hash.info.key?("email")).to be true
+      expect(auth_hash.info.email).to be_nil
+      expect(auth_hash.extra.custom["email"]).to eq("custom@x.edu")
     end
 
-    it "does not fill standard OmniAuth info fields from custom parameters" do
-      info = build_info("sub" => "user-42", custom_claim => { "name" => "Ada Lovelace" })
-
-      expect(info.name).to be_nil
-      expect(info.custom_name).to eq("Ada Lovelace")
-    end
-
-    it "does not mutate the decoded token while building info" do
+    it "does not mutate the decoded token while building the auth_hash" do
       claims = { "sub" => "user-42", custom_claim => { "canvas_user_id" => "1234" } }
 
-      build_info(claims)
+      build_extra(claims)
 
       expect(claims[custom_claim]).to eq({ "canvas_user_id" => "1234" })
-    end
-
-    it "ignores a custom claim that isn't an object, rather than sinking an otherwise valid launch" do
-      info = build_info("sub" => "user-42", "email" => "student@example.edu", custom_claim => "not-an-object")
-
-      expect(info.email).to eq("student@example.edu")
     end
 
     it "carries custom parameters through a full launch, not just a direct build_auth_hash call" do
@@ -680,12 +679,13 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
         issuer: canvas_platform[:issuer],
         client_id: canvas_platform[:client_id],
         extra_claims: base_deployment_claim.merge(
-          custom_claim => { "canvas_user_id" => "1234", "department" => "Music Library" }
+          custom_claim => { "course_term_name" => "Default Term", "department" => "Music Library" }
         )
       )
 
-      expect(env["omniauth.auth"].info.custom_canvas_user_id).to eq("1234")
-      expect(env["omniauth.auth"].info.custom_department).to eq("Music Library")
+      custom = env["omniauth.auth"].extra.custom
+      expect(custom["course_term_name"]).to eq("Default Term")
+      expect(custom["department"]).to eq("Music Library")
     end
   end
 

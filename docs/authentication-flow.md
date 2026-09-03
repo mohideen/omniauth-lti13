@@ -142,7 +142,7 @@ deployment — and builds the `auth_hash`.
 flowchart LR
     sub["sub"] --> uid["auth_hash.uid"]
     email["email"] --> infoEmail["auth_hash.info.email"]
-    custom[".../custom<br/>(each parameter)"] --> infoCustom["info.custom_&lt;param name&gt;"]
+    custom[".../custom"] --> extraCustom["extra.custom<br/>(keys verbatim)"]
     ctxId[".../context.id"] --> ctxIdOut["extra.context_id"]
     label[".../context.label"] --> name["extra.context_name"]
     title[".../context.title"] -.->|fallback when<br/>label absent| name
@@ -156,12 +156,16 @@ flowchart LR
 context claim carries neither, `context_name` is an explicit `nil` rather than an absent key, so
 the host app can distinguish "not present" from "key missing".
 
-Custom claim parameters — whatever was configured in the tool registration — are merged into
-`info` under a `custom_` prefix, which keeps the Platform's namespace separate from the standard
-fields: a custom parameter named `email` or `name` lands on `custom_email` / `custom_name` and
-can never shadow the field of that name. The one dashed edge above is the sole precedence rule
-left: `title` fills `context_name` only when `label` is absent. See the README for the full
-contract.
+Custom claim parameters — whatever was configured in the tool registration — land at
+`extra.custom`, keyed exactly as the Platform named them. They sit on `extra` rather than `info`
+because that is OmniAuth's split: `info` is a defined schema, `extra` is for provider-specific
+data. `extra.custom` is always a Hash, empty when the claim is absent, so `extra.custom["x"]`
+returns nil instead of raising on a nil intermediate — and nothing custom can shadow a standard
+`info` field. This is deliberately the same shape the LTI 1.1 strategy exposes, so a host app
+reading `extra.custom["…"]` works under either protocol.
+
+The one dashed edge above is the sole precedence rule left: `title` fills `context_name` only
+when `label` is absent. See the README for the full contract.
 
 ## Session keys
 

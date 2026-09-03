@@ -128,8 +128,9 @@ On a successful launch, `env["omniauth.auth"]` is populated with:
 ```ruby
 auth_hash.uid                          # LTI `sub`
 auth_hash.info.email                   # LTI `email` (nil if the Platform didn't send one)
-auth_hash.info.custom_<param>          # each parameter from the custom claim, under a
-                                        # `custom_` prefix -- see "Custom parameters" below
+auth_hash.extra.custom                 # the custom claim's parameters, keyed as the Platform
+                                        # named them; always a Hash, never nil -- see
+                                        # "Custom parameters" below
 auth_hash.extra.context_id             # context claim's `id`
 auth_hash.extra.context_name           # context claim's `label`, falling back to `title`
                                         # if label is absent; explicit nil if neither is
@@ -150,27 +151,39 @@ additive, exposing the full title separately for callers that want it.
 The LTI custom claim (`https://purl.imsglobal.org/spec/lti/claim/custom`) carries whatever
 parameters were configured in the tool registration on the Platform — a campus username, an
 internal user id, a department code. They arrive inside the signed `id_token`, so they are as
-trustworthy as any other claim, and each is merged into `info` under a **`custom_` prefix**:
+trustworthy as any other claim, and all of them are exposed at **`extra.custom`**, keyed exactly
+as the Platform named them:
 
 ```ruby
 # custom claim: { "canvas_user_id" => "1234", "department" => "Music Library" }
-auth_hash.info.custom_canvas_user_id  # => "1234"
-auth_hash.info.custom_department      # => "Music Library"
+auth_hash.extra.custom["canvas_user_id"]  # => "1234"
+auth_hash.extra.custom["department"]      # => "Music Library"
+auth_hash.extra.custom                    # => the whole hash, enumerable
 ```
 
-The prefix keeps the Platform's namespace and this gem's separate, which has two consequences:
+They live on `extra`, not `info`, because that is OmniAuth's own split: `info` is a *defined
+schema* (`InfoHash` — name, email, nickname, image, …), while `extra` is where provider-specific
+data belongs. Three consequences worth knowing:
 
-- **A custom parameter can never shadow a standard `info` field.** One named `email`, `name`, or
-  `nickname` lands on `custom_email` / `custom_name` / `custom_nickname`; the standard fields are
-  only ever set from their own claims.
+- **`extra.custom` is always present**, an empty Hash when the Platform sends no custom claim. So
+  `extra.custom["anything"]` returns nil rather than raising — a nil intermediate can't happen.
+- **A custom parameter can never shadow a standard `info` field.** One named `email` or `name`
+  stays at `extra.custom["email"]` / `extra.custom["name"]`; `info` is built from standard claims
+  alone.
 - **`info.email` comes from the standard `email` claim alone**, and is an explicit `nil` when the
   Platform doesn't send one. If your Platform releases email *only* as a custom parameter — some
-  do — it will be at `info.custom_email`, and `info.email` will be nil. Read it from there, or
-  configure the Platform to release the standard claim.
+  do — it will be at `extra.custom["email"]`. Read it from there, or configure the Platform to
+  release the standard claim.
 
-A Platform that sends something other than a JSON object for this claim is ignored rather than
-allowed to raise: custom parameters are optional, and a malformed one shouldn't sink an
-otherwise valid launch.
+A Platform that sends something other than a JSON object for this claim is ignored (yielding an
+empty `extra.custom`) rather than allowed to raise: custom parameters are optional, and a
+malformed one shouldn't sink an otherwise valid launch.
+
+**This matches the LTI 1.1 shape.** LTI 1.1 sends custom parameters `custom_`-prefixed on the
+wire, and `ims-lti` strips that prefix when parsing, so
+[`omniauth-lti`](https://github.com/avalonmediasystem/omniauth-lti) can expose the identical
+`extra.custom` hash. Code reading `auth_hash.extra.custom["course_term_name"]` therefore works
+unchanged under either protocol, which matters while migrating an instance from 1.1 to 1.3.
 
 ### What the host app must handle
 

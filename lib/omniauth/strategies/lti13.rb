@@ -321,7 +321,11 @@ module OmniAuth
         AuthHash.new(
           provider: name,
           uid: claims["sub"],
-          info: build_info(claims),
+          # The standard email claim alone. Platform-defined values go to
+          # `extra`, per OmniAuth's split: `info` is a defined schema
+          # (InfoHash -- name, email, nickname, image, ...), `extra` is where
+          # provider-specific data belongs.
+          info: { email: claims["email"] },
           extra: {
             # label wins over title, preserving LTI 1.1 semantics where
             # Course.title held the label, not a full title; title is only a
@@ -332,35 +336,32 @@ module OmniAuth
             context_title: title,
             consumer: { context_label: label },
             roles: claims[OmniAuth::Lti13::Claims::ROLES],
+            custom: custom_params(claims),
           }
         )
       end
 
-      # `info` is the standard `email` claim plus every custom-claim
-      # parameter, each under a `custom_` prefix. `info.email` is always set,
-      # to an explicit nil when the Platform sends no email -- consumers rely
-      # on the key existing.
-      def build_info(claims)
-        custom_params(claims).merge("email" => claims["email"])
-      end
-
       # The custom claim is a flat JSON object of parameters configured in the
       # tool registration on the Platform, arriving inside the signed token.
+      # Keys are passed through exactly as the Platform named them -- the LTI
+      # 1.3 claim is already a namespace of its own, so nothing is prefixed or
+      # otherwise mangled.
       #
-      # Keys are prefixed with `custom_` and stringified, which namespaces
-      # them away from the standard fields entirely: a Platform parameter
-      # named `email` lands on `info.custom_email` and cannot shadow the
-      # standard `email` claim, and one named `name` or `nickname` no longer
-      # fills the OmniAuth field of that name. Copied rather than referenced,
-      # since merging into it in place would mutate the decoded token. A
-      # Platform that sends something other than an object for this claim is
-      # ignored rather than allowed to raise -- custom params are optional,
-      # and a malformed one shouldn't sink an otherwise valid launch.
+      # Always returns a Hash, never nil, so `extra.custom` is present even
+      # when the Platform sends no custom claim. That matters: a consumer
+      # writing `extra.custom.whatever` gets nil for an unknown key, rather
+      # than a NoMethodError from dereferencing a nil intermediate.
+      #
+      # Copied rather than referenced, since a caller merging into it in place
+      # would mutate the decoded token. A Platform that sends something other
+      # than an object here is ignored rather than allowed to raise -- custom
+      # params are optional, and a malformed one shouldn't sink an otherwise
+      # valid launch.
       def custom_params(claims)
         custom = claims[OmniAuth::Lti13::Claims::CUSTOM]
         return {} unless custom.is_a?(Hash)
 
-        custom.to_h.transform_keys { |key| "custom_#{key}" }
+        custom.to_h.transform_keys(&:to_s)
       end
     end
   end
