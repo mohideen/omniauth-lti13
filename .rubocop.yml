@@ -60,8 +60,10 @@ Metrics/AbcSize:
 Metrics/ParameterLists:
   CountKeywordArgs: false
 
+# The strategy class is one coherent unit -- the launch flow end to end --
+# and is organized by flow banners rather than wanting to be split.
 Metrics/ClassLength:
-  Max: 150
+  Max: 175
 
 # PlatformRegistry#find is a deliberate decision cascade (blank issuer ->
 # no match -> single match -> ambiguous -> disambiguate by client_id), and
@@ -77,6 +79,12 @@ RSpec/ExampleLength:
   Max: 25
 
 RSpec/MultipleExpectations:
+  Max: 8
+
+# The strategy spec's outer group defines the shared launch fixtures
+# (platforms, initiation params, deployment claim) that every nested group
+# builds on, so any nested `let` at all trips the default of 5.
+RSpec/MultipleMemoizedHelpers:
   Max: 8
 
 RSpec/DescribeClass:

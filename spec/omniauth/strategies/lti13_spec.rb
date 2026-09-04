@@ -178,6 +178,18 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
       expect(redirect_params["scope"]).to eq("openid")
     end
 
+    it "includes prompt=none in the authorization request (Canvas requires it; omitting it " \
+       "causes Canvas to respond with error=invalid_request_object before the form_post callback)" do
+      response = post_to_request_phase(
+        platforms: [canvas_platform],
+        params: valid_initiation_params.merge(iss: canvas_platform[:issuer])
+      )
+
+      redirect_params = redirect_query_params(response)
+
+      expect(redirect_params["prompt"]).to eq("none")
+    end
+
     it "threads login_hint, lti_message_hint, and target_link_uri through to the authorization request " \
        "unmodified, without dropping lti_message_hint" do
       response = post_to_request_phase(
@@ -490,6 +502,58 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
     end
   end
 
+  describe "error callbacks from the Platform (e.g. missing prompt)" do
+    # When the Platform rejects the authorization request before issuing an
+    # id_token (Canvas does this for missing prompt=none), it redirects back
+    # to the callback URL with error= instead of posting an id_token. The
+    # strategy must not raise UnregisteredPlatformError in setup_phase in
+    # this case -- the session key omniauth.lti13.iss may not be present
+    # (error redirect vs. form_post uses a different browser round-trip), so
+    # setup_phase skips platform resolution and lets callback_phase surface
+    # the error from the Platform instead.
+    def perform_error_callback(platforms:, error:, error_description: nil, session: {})
+      downstream_env = nil
+      rack_app = build_rack_app(platforms: platforms) do |env|
+        downstream_env = env
+        [200, {}, ["ok"]]
+      end
+
+      query_params = { error: error }
+      query_params[:error_description] = error_description if error_description
+      callback_env = Rack::MockRequest.env_for(
+        "/auth/lti/callback?#{to_query(query_params)}", method: "GET", "rack.session" => session
+      )
+      response = Rack::MockResponse.new(*rack_app.call(callback_env))
+
+      [response, downstream_env]
+    end
+
+    it "redirects to /auth/failure with the Platform's error, rather than raising " \
+       "UnregisteredPlatformError because omniauth.lti13.iss is absent from the session" do
+      response, _env = perform_error_callback(
+        platforms: [canvas_platform],
+        error: "invalid_request_object",
+        error_description: "The following parameters are missing: prompt"
+      )
+
+      expect(response.status).to eq(302)
+      expect(response.location).to start_with("/auth/failure")
+      expect(response.location).to include("invalid_request_object")
+    end
+
+    it "also handles an error callback that arrives with a stale session " \
+       "(session cookie not sent back by the browser)" do
+      response, _env = perform_error_callback(
+        platforms: [canvas_platform],
+        error: "access_denied",
+        session: {}
+      )
+
+      expect(response.status).to eq(302)
+      expect(response.location).to start_with("/auth/failure")
+    end
+  end
+
   describe "#build_auth_hash (private; exercised directly for the context label/title precedence matrix)" do
     def claims_with_context(context)
       {
@@ -530,6 +594,98 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
 
       expect(auth_hash.extra.key?("context_name")).to be true
       expect(auth_hash.extra.context_name).to be_nil
+    end
+  end
+
+  describe "custom claim parameters in auth_hash.extra.custom" do
+    let(:custom_claim) { "https://purl.imsglobal.org/spec/lti/claim/custom" }
+
+    def build_extra(claims)
+      strategy.send(:build_auth_hash, claims).extra
+    end
+
+    it "exposes each configured custom parameter under its own name, unprefixed" do
+      extra = build_extra(
+        "sub" => "user-42",
+        custom_claim => { "course_term_name" => "Default Term", "canvas_user_id" => "1234" }
+      )
+
+      expect(extra.custom["course_term_name"]).to eq("Default Term")
+      expect(extra.custom["canvas_user_id"]).to eq("1234")
+    end
+
+    # Regression guard for the production 500 this shape was chosen to make
+    # impossible: a launch with no custom claim must still leave `extra.custom`
+    # present, so dereferencing an unknown key returns nil instead of raising
+    # NoMethodError on a nil intermediate.
+    it "leaves extra.custom an empty hash, never nil, when the Platform sends no custom claim" do
+      extra = build_extra("sub" => "user-42")
+
+      expect(extra.custom).to eq({})
+      expect { extra.custom.anything_at_all }.not_to raise_error
+      expect(extra.custom.anything_at_all).to be_nil
+    end
+
+    it "leaves extra.custom an empty hash when the custom claim isn't an object, " \
+       "rather than sinking an otherwise valid launch" do
+      extra = build_extra("sub" => "user-42", custom_claim => "not-an-object")
+
+      expect(extra.custom).to eq({})
+      expect(extra.custom.anything_at_all).to be_nil
+    end
+
+    # Asserted via `info["name"]` rather than `info.name`: OmniAuth's InfoHash
+    # defines `name` as a computed method that falls back to first/last name,
+    # then nickname, then *email* -- so `info.name` is never nil here, no
+    # matter what we do. The raw key lookup is what shows the custom parameter
+    # never landed in info.
+    it "keeps custom parameters out of info entirely, so none can shadow a standard field" do
+      auth_hash = strategy.send(
+        :build_auth_hash,
+        "sub" => "user-42",
+        "email" => "standard@example.edu",
+        custom_claim => { "email" => "custom@example.edu", "name" => "Ada Lovelace" }
+      )
+
+      expect(auth_hash.info.email).to eq("standard@example.edu")
+      expect(auth_hash.info.key?("name")).to be false
+      expect(auth_hash.info["name"]).to be_nil
+      expect(auth_hash.extra.custom["email"]).to eq("custom@example.edu")
+      expect(auth_hash.extra.custom["name"]).to eq("Ada Lovelace")
+    end
+
+    # A Platform releasing email only as a custom parameter leaves info.email
+    # nil; the value is reachable at extra.custom["email"] for a host app that
+    # wants to fall back to it.
+    it "does not populate info.email from a custom email parameter" do
+      auth_hash = strategy.send(:build_auth_hash, "sub" => "user-42", custom_claim => { "email" => "custom@x.edu" })
+
+      expect(auth_hash.info.key?("email")).to be true
+      expect(auth_hash.info.email).to be_nil
+      expect(auth_hash.extra.custom["email"]).to eq("custom@x.edu")
+    end
+
+    it "does not mutate the decoded token while building the auth_hash" do
+      claims = { "sub" => "user-42", custom_claim => { "canvas_user_id" => "1234" } }
+
+      build_extra(claims)
+
+      expect(claims[custom_claim]).to eq({ "canvas_user_id" => "1234" })
+    end
+
+    it "carries custom parameters through a full launch, not just a direct build_auth_hash call" do
+      _response, env = perform_full_launch(
+        platforms: [canvas_platform],
+        issuer: canvas_platform[:issuer],
+        client_id: canvas_platform[:client_id],
+        extra_claims: base_deployment_claim.merge(
+          custom_claim => { "course_term_name" => "Default Term", "department" => "Music Library" }
+        )
+      )
+
+      custom = env["omniauth.auth"].extra.custom
+      expect(custom["course_term_name"]).to eq("Default Term")
+      expect(custom["department"]).to eq("Music Library")
     end
   end
 

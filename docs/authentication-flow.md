@@ -39,7 +39,7 @@ sequenceDiagram
         LMS->>Tool: POST /users/auth/lti<br/>iss, login_hint, target_link_uri,<br/>lti_message_hint, [client_id], [deployment_id]
         Note right of Tool: setup_phase<br/>resolve Platform by (iss, client_id)
         Note right of Tool: request_phase<br/>validate initiation params<br/>stash iss + client_id in session<br/>generate state + nonce
-        Tool-->>User: 302 → authorization_endpoint<br/>response_type=id_token, response_mode=form_post,<br/>scope=openid, client_id, redirect_uri, state, nonce,<br/>login_hint, lti_message_hint, target_link_uri
+        Tool-->>User: 302 → authorization_endpoint<br/>response_type=id_token, response_mode=form_post,<br/>prompt=none, scope=openid, client_id, redirect_uri,<br/>state, nonce, login_hint, lti_message_hint, target_link_uri
     end
 
     User->>LMS: GET authorization_endpoint
@@ -91,8 +91,9 @@ belongs to:
    becoming a broken authorization request that fails less legibly on the Platform's.
 2. Stashes `omniauth.lti13.iss` and `omniauth.lti13.client_id` in the session for leg 2.
 3. `super` builds the authorization redirect: `response_type=id_token`,
-   `response_mode=form_post`, `scope=openid`, plus `state` and `nonce` (both stored in the
-   session) and the three IMS round-trip params echoed back unchanged.
+   `response_mode=form_post`, `prompt=none`, `scope=openid`, plus `state` and `nonce` (both
+   stored in the session) and the three IMS round-trip params echoed back unchanged. Canvas
+   rejects the request outright if `prompt=none` is missing, before any token is issued.
 
 `client_id` and `deployment_id` from the initiation request are deliberately **not** forwarded
 as authorize params — they are read for validation only, so an unauthenticated param can never
@@ -108,6 +109,12 @@ read **from the session**, never from request params, then `consume_stashed_plat
 deletes them (one-time use, mirroring `state`/`nonce`). A callback with no prior request phase —
 a missing or dropped session — therefore resolves no Platform and is rejected, rather than being
 allowed to select one from an attacker-controlled `iss`.
+
+The one exception: if the callback carries an `error` param, the Platform is telling us the
+launch already failed on its side, so resolution is skipped and the inherited `callback_phase`
+surfaces that error. Resolving first would raise `UnregisteredPlatformError` over the top of it
+(the session key doesn't reliably survive an error redirect) and hide the real cause. Nothing is
+authenticated on that path — it only decides which failure the operator sees.
 
 **`state`** is then checked against the session by the inherited `callback_phase`.
 
@@ -135,6 +142,7 @@ deployment — and builds the `auth_hash`.
 flowchart LR
     sub["sub"] --> uid["auth_hash.uid"]
     email["email"] --> infoEmail["auth_hash.info.email"]
+    custom[".../custom"] --> extraCustom["extra.custom<br/>(keys verbatim)"]
     ctxId[".../context.id"] --> ctxIdOut["extra.context_id"]
     label[".../context.label"] --> name["extra.context_name"]
     title[".../context.title"] -.->|fallback when<br/>label absent| name
@@ -146,8 +154,18 @@ flowchart LR
 `context_name` prefers `label` and falls back to `title`, preserving LTI 1.1 semantics where
 `Course.title` held the short label; `context_title` exposes the full title additively. When the
 context claim carries neither, `context_name` is an explicit `nil` rather than an absent key, so
-the host app can distinguish "not present" from "key missing". See the README for the full
-contract.
+the host app can distinguish "not present" from "key missing".
+
+Custom claim parameters — whatever was configured in the tool registration — land at
+`extra.custom`, keyed exactly as the Platform named them. They sit on `extra` rather than `info`
+because that is OmniAuth's split: `info` is a defined schema, `extra` is for provider-specific
+data. `extra.custom` is always a Hash, empty when the claim is absent, so `extra.custom["x"]`
+returns nil instead of raising on a nil intermediate — and nothing custom can shadow a standard
+`info` field. This is deliberately the same shape the LTI 1.1 strategy exposes, so a host app
+reading `extra.custom["…"]` works under either protocol.
+
+The one dashed edge above is the sole precedence rule left: `title` fills `context_name` only
+when `label` is absent. See the README for the full contract.
 
 ## Session keys
 

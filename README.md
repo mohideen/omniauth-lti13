@@ -128,6 +128,9 @@ On a successful launch, `env["omniauth.auth"]` is populated with:
 ```ruby
 auth_hash.uid                          # LTI `sub`
 auth_hash.info.email                   # LTI `email` (nil if the Platform didn't send one)
+auth_hash.extra.custom                 # the custom claim's parameters, keyed as the Platform
+                                        # named them; always a Hash, never nil -- see
+                                        # "Custom parameters" below
 auth_hash.extra.context_id             # context claim's `id`
 auth_hash.extra.context_name           # context claim's `label`, falling back to `title`
                                         # if label is absent; explicit nil if neither is
@@ -142,6 +145,45 @@ auth_hash.extra.roles                  # roles claim, passed through unmodified
 `omniauth-lti` fork's behavior (`context_label` mapped to what became `Course.title`), so
 instances upgrading from 1.1 don't see existing course titles change. `context_title` is
 additive, exposing the full title separately for callers that want it.
+
+#### Custom parameters
+
+The LTI custom claim (`https://purl.imsglobal.org/spec/lti/claim/custom`) carries whatever
+parameters were configured in the tool registration on the Platform — a campus username, an
+internal user id, a department code. They arrive inside the signed `id_token`, so they are as
+trustworthy as any other claim, and all of them are exposed at **`extra.custom`**, keyed exactly
+as the Platform named them:
+
+```ruby
+# custom claim: { "canvas_user_id" => "1234", "department" => "Music Library" }
+auth_hash.extra.custom["canvas_user_id"]  # => "1234"
+auth_hash.extra.custom["department"]      # => "Music Library"
+auth_hash.extra.custom                    # => the whole hash, enumerable
+```
+
+They live on `extra`, not `info`, because that is OmniAuth's own split: `info` is a *defined
+schema* (`InfoHash` — name, email, nickname, image, …), while `extra` is where provider-specific
+data belongs. Three consequences worth knowing:
+
+- **`extra.custom` is always present**, an empty Hash when the Platform sends no custom claim. So
+  `extra.custom["anything"]` returns nil rather than raising — a nil intermediate can't happen.
+- **A custom parameter can never shadow a standard `info` field.** One named `email` or `name`
+  stays at `extra.custom["email"]` / `extra.custom["name"]`; `info` is built from standard claims
+  alone.
+- **`info.email` comes from the standard `email` claim alone**, and is an explicit `nil` when the
+  Platform doesn't send one. If your Platform releases email *only* as a custom parameter — some
+  do — it will be at `extra.custom["email"]`. Read it from there, or configure the Platform to
+  release the standard claim.
+
+A Platform that sends something other than a JSON object for this claim is ignored (yielding an
+empty `extra.custom`) rather than allowed to raise: custom parameters are optional, and a
+malformed one shouldn't sink an otherwise valid launch.
+
+**This matches the LTI 1.1 shape.** LTI 1.1 sends custom parameters `custom_`-prefixed on the
+wire, and `ims-lti` strips that prefix when parsing, so
+[`omniauth-lti`](https://github.com/avalonmediasystem/omniauth-lti) can expose the identical
+`extra.custom` hash. Code reading `auth_hash.extra.custom["course_term_name"]` therefore works
+unchanged under either protocol, which matters while migrating an instance from 1.1 to 1.3.
 
 ### What the host app must handle
 
@@ -189,7 +231,9 @@ to be handled in the host app, not here:
   Authentication Response never carries one (only `id_token` and `state` do) and JWTs aren't
   encrypted, so anyone holding a captured `id_token` could otherwise read its `nonce` claim and
   echo it back as a param to replay that token into a session of their own.
-- **`response_mode=form_post`**, per the IMS Security Framework.
+- **`response_mode=form_post`** and **`prompt=none`**, per the IMS Security Framework. Canvas
+  rejects an authorization request that omits `prompt=none` with
+  `error=invalid_request_object`, before any `id_token` is posted back.
 
 ## Errors and troubleshooting
 
@@ -268,6 +312,13 @@ by that first leg, and does *not* fall back to request params. A callback arrivi
 prior request phase (missing or wiped session) is therefore rejected outright rather than being
 allowed to select a platform from an attacker-controlled `iss`. This is what makes a dropped
 session cookie surface as `issuer nil` (see "What the host app must handle" above).
+
+There is one deliberate exception: a callback carrying an `error` param skips resolution
+entirely, so the base class's `callback_phase` can surface the Platform's own error. The session
+key may not survive an error redirect the way it survives the normal `form_post` round-trip, and
+attempting a lookup there would raise `UnregisteredPlatformError` (`issuer nil`) *over* the real
+error, masking the actual cause. Nothing is authenticated on that path -- it only chooses which
+failure the operator sees.
 
 **The id_token is decoded twice per callback.** `verify_id_token!` decodes to validate claims,
 then `id_token_callback_phase` decodes again to build the `auth_hash`. This is deliberate: the

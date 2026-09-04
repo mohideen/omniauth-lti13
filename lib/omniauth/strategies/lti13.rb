@@ -49,6 +49,12 @@ module OmniAuth
       # platform lookup resolved.
       option :allow_authorize_params, %i[login_hint lti_message_hint target_link_uri]
 
+      # Canvas (and LTI 1.3 in general) requires prompt=none in the
+      # authorization request. The base class includes it when set; nil
+      # means the param is omitted, which causes Canvas to reject the
+      # request with error=invalid_request_object.
+      option :prompt, "none"
+
       # Tolerance (seconds) for ordinary clock drift against the Platform
       # when checking exp/iat. Configurable; the allowlist below is not,
       # since the IMS Security Framework mandates RS256 specifically.
@@ -88,6 +94,14 @@ module OmniAuth
       # `:setup` option is deliberately unsupported here -- see "Design notes"
       # (the :setup option) for why it can't compose with this resolution.
       def setup_phase
+        # If the Platform already reported an error (e.g. missing prompt),
+        # skip platform resolution -- callback_phase will surface the
+        # error param without needing a valid platform. Attempting lookup
+        # here would raise UnregisteredPlatformError (issuer nil, since the
+        # session key omniauth.lti13.iss may not survive an error redirect)
+        # and mask the real error before the base class can handle it.
+        return if !on_request_path? && request.params["error"].present?
+
         issuer = current_iss
         client_id = current_client_id
         consume_stashed_platform_ref! unless on_request_path?
@@ -306,6 +320,10 @@ module OmniAuth
         AuthHash.new(
           provider: name,
           uid: claims["sub"],
+          # The standard email claim alone. Platform-defined values go to
+          # `extra`, per OmniAuth's split: `info` is a defined schema
+          # (InfoHash -- name, email, nickname, image, ...), `extra` is where
+          # provider-specific data belongs.
           info: { email: claims["email"] },
           extra: {
             # label wins over title, preserving LTI 1.1 semantics where
@@ -317,8 +335,32 @@ module OmniAuth
             context_title: title,
             consumer: { context_label: label },
             roles: claims[OmniAuth::Lti13::Claims::ROLES],
+            custom: custom_params(claims),
           }
         )
+      end
+
+      # The custom claim is a flat JSON object of parameters configured in the
+      # tool registration on the Platform, arriving inside the signed token.
+      # Keys are passed through exactly as the Platform named them -- the LTI
+      # 1.3 claim is already a namespace of its own, so nothing is prefixed or
+      # otherwise mangled.
+      #
+      # Always returns a Hash, never nil, so `extra.custom` is present even
+      # when the Platform sends no custom claim. That matters: a consumer
+      # writing `extra.custom.whatever` gets nil for an unknown key, rather
+      # than a NoMethodError from dereferencing a nil intermediate.
+      #
+      # Copied rather than referenced, since a caller merging into it in place
+      # would mutate the decoded token. A Platform that sends something other
+      # than an object here is ignored rather than allowed to raise -- custom
+      # params are optional, and a malformed one shouldn't sink an otherwise
+      # valid launch.
+      def custom_params(claims)
+        custom = claims[OmniAuth::Lti13::Claims::CUSTOM]
+        return {} unless custom.is_a?(Hash)
+
+        custom.to_h.transform_keys(&:to_s)
       end
     end
   end

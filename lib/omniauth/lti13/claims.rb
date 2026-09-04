@@ -11,6 +11,7 @@ module OmniAuth
       CONTEXT = "https://purl.imsglobal.org/spec/lti/claim/context"
       DEPLOYMENT_ID = "https://purl.imsglobal.org/spec/lti/claim/deployment_id"
       ROLES = "https://purl.imsglobal.org/spec/lti/claim/roles"
+      CUSTOM = "https://purl.imsglobal.org/spec/lti/claim/custom"
     end
   end
 end
