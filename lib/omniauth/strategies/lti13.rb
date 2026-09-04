@@ -285,7 +285,6 @@ module OmniAuth
       # verify_id_token! is deliberate.
       def id_token_callback_phase
         claims = decode_id_token(params["id_token"]).raw_attributes
-        log :debug, "id_token raw_attributes #{claims.inspect}"
         validate_deployment!(claims)
 
         env["omniauth.auth"] = build_auth_hash(claims)
