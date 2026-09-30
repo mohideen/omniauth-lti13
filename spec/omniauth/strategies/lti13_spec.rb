@@ -323,10 +323,10 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
             "label" => "TEST101",
             "title" => "Introduction to Testing",
           },
-          "https://purl.imsglobal.org/spec/lti/claim/roles" => ["Learner"]
+          "https://purl.imsglobal.org/spec/lti/claim/roles" => ["Learner"],
+          "custom_attribute" => "custom_value"
         )
       )
-
       auth_hash = env["omniauth.auth"]
 
       expect(auth_hash.uid).to eq("user-42")
@@ -336,6 +336,7 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
       expect(auth_hash.extra.consumer.context_label).to eq("TEST101")
       expect(auth_hash.extra.context_title).to eq("Introduction to Testing")
       expect(auth_hash.extra.roles).to eq(["Learner"])
+      expect(auth_hash.extra.raw_info).to include("custom_attribute" => "custom_value")
     end
 
     it "resolves the correct platform on the callback leg too, via the client_id stashed during the request " \
@@ -594,6 +595,19 @@ RSpec.describe OmniAuth::Strategies::Lti13 do
 
       expect(auth_hash.extra.key?("context_name")).to be true
       expect(auth_hash.extra.context_name).to be_nil
+    end
+
+    it "includes the raw attribues" do
+      claims = {
+        "sub" => "user-42",
+        "email" => "student@example.edu",
+        "custom_attribute" => "custom_value"
+      }
+
+      auth_hash = strategy.send(:build_auth_hash, claims)
+      expect(auth_hash.uid).to eq("user-42")
+      expect(auth_hash.info.email).to eq("student@example.edu")
+      expect(auth_hash.extra.raw_info).to eq(claims)
     end
   end
 

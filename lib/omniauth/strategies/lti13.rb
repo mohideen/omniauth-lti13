@@ -336,6 +336,7 @@ module OmniAuth
             consumer: { context_label: label },
             roles: claims[OmniAuth::Lti13::Claims::ROLES],
             custom: custom_params(claims),
+            raw_info: claims
           }
         )
       end
